@@ -125,6 +125,15 @@ pub enum ClientConfigKey {
     ///
     /// This will spread the connections across more servers.
     RandomizeAddresses,
+    /// Read timeout
+    ///
+    /// The timeout applies to each read operation, and resets after a
+    /// successful read. This is useful for detecting stalled connections
+    /// when the size of the response is not known beforehand.
+    ///
+    /// Supported keys:
+    /// - `read_timeout`
+    ReadTimeout,
     /// Request timeout
     ///
     /// The timeout is applied from when the request starts connecting until the
@@ -153,6 +162,7 @@ impl AsRef<str> for ClientConfigKey {
             Self::ProxyCaCertificate => "proxy_ca_certificate",
             Self::ProxyExcludes => "proxy_excludes",
             Self::RandomizeAddresses => "randomize_addresses",
+            Self::ReadTimeout => "read_timeout",
             Self::Timeout => "timeout",
             Self::UserAgent => "user_agent",
         }
@@ -180,6 +190,7 @@ impl FromStr for ClientConfigKey {
             "proxy_ca_certificate" => Ok(Self::ProxyCaCertificate),
             "proxy_excludes" => Ok(Self::ProxyExcludes),
             "randomize_addresses" => Ok(Self::RandomizeAddresses),
+            "read_timeout" => Ok(Self::ReadTimeout),
             "timeout" => Ok(Self::Timeout),
             "user_agent" => Ok(Self::UserAgent),
             _ => Err(super::Error::UnknownConfigurationKey {
@@ -257,6 +268,7 @@ pub struct ClientOptions {
     allow_insecure: ConfigValue<bool>,
     timeout: Option<ConfigValue<Duration>>,
     connect_timeout: Option<ConfigValue<Duration>>,
+    read_timeout: Option<ConfigValue<Duration>>,
     pool_idle_timeout: Option<ConfigValue<Duration>>,
     pool_max_idle_per_host: Option<ConfigValue<usize>>,
     http2_keep_alive_interval: Option<ConfigValue<Duration>>,
@@ -291,6 +303,7 @@ impl Default for ClientOptions {
             allow_insecure: Default::default(),
             timeout: Some(Duration::from_secs(30).into()),
             connect_timeout: Some(Duration::from_secs(5).into()),
+            read_timeout: None,
             pool_idle_timeout: None,
             pool_max_idle_per_host: None,
             http2_keep_alive_interval: None,
@@ -320,6 +333,9 @@ impl ClientOptions {
             ClientConfigKey::AllowInvalidCertificates => self.allow_insecure.parse(value),
             ClientConfigKey::ConnectTimeout => {
                 self.connect_timeout = Some(ConfigValue::Deferred(value.into()))
+            }
+            ClientConfigKey::ReadTimeout => {
+                self.read_timeout = Some(ConfigValue::Deferred(value.into()))
             }
             ClientConfigKey::DefaultContentType => self.default_content_type = Some(value.into()),
             ClientConfigKey::Http1Only => self.http1_only.parse(value),
@@ -362,6 +378,7 @@ impl ClientOptions {
             ClientConfigKey::AllowHttp => Some(self.allow_http.to_string()),
             ClientConfigKey::AllowInvalidCertificates => Some(self.allow_insecure.to_string()),
             ClientConfigKey::ConnectTimeout => self.connect_timeout.as_ref().map(fmt_duration),
+            ClientConfigKey::ReadTimeout => self.read_timeout.as_ref().map(fmt_duration),
             ClientConfigKey::DefaultContentType => self.default_content_type.clone(),
             ClientConfigKey::Http1Only => Some(self.http1_only.to_string()),
             ClientConfigKey::Http2KeepAliveInterval => {
@@ -556,6 +573,36 @@ impl ClientOptions {
         self
     }
 
+    /// Set a read timeout
+    ///
+    /// The timeout applies to each read operation, and resets after a
+    /// successful read. This is useful for detecting stalled connections
+    /// when the size of the response is not known beforehand.
+    ///
+    /// Timeout errors are retried, subject to the [`RetryConfig`]
+    ///
+    /// Default is disabled (no read timeout)
+    ///
+    /// # See Also
+    /// * [`Self::with_read_timeout_disabled`] to disable the read timeout
+    /// * [`Self::with_timeout`] to set a timeout for the overall request
+    /// * [`Self::with_connect_timeout`] to set a timeout for the connect phase
+    ///
+    /// [`RetryConfig`]: crate::RetryConfig
+    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(ConfigValue::Parsed(timeout));
+        self
+    }
+
+    /// Disables the read timeout
+    ///
+    /// # See Also
+    /// * [`Self::with_read_timeout`]
+    pub fn with_read_timeout_disabled(mut self) -> Self {
+        self.read_timeout = None;
+        self
+    }
+
     /// Set the pool max idle timeout
     ///
     /// This is the length of time an idle connection will be kept alive
@@ -684,6 +731,10 @@ impl ClientOptions {
 
         if let Some(timeout) = &self.connect_timeout {
             builder = builder.connect_timeout(timeout.get()?)
+        }
+
+        if let Some(timeout) = &self.read_timeout {
+            builder = builder.read_timeout(timeout.get()?)
         }
 
         if let Some(timeout) = &self.pool_idle_timeout {
@@ -918,6 +969,7 @@ mod tests {
         let pool_idle_timeout = "93 seconds".to_string();
         let pool_max_idle_per_host = "94".to_string();
         let proxy_url = "https://fake_proxy_url".to_string();
+        let read_timeout = "45 seconds".to_string();
         let timeout = "95 seconds".to_string();
         let user_agent = "object_store:fake_user_agent".to_string();
 
@@ -944,6 +996,7 @@ mod tests {
             ("pool_idle_timeout", pool_idle_timeout.clone()),
             ("pool_max_idle_per_host", pool_max_idle_per_host.clone()),
             ("proxy_url", proxy_url.clone()),
+            ("read_timeout", read_timeout.clone()),
             ("timeout", timeout.clone()),
             ("user_agent", user_agent.clone()),
         ]);
@@ -1032,6 +1085,12 @@ mod tests {
                 .get_config_value(&ClientConfigKey::ProxyUrl)
                 .unwrap(),
             proxy_url
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&ClientConfigKey::ReadTimeout)
+                .unwrap(),
+            read_timeout
         );
         assert_eq!(
             builder.get_config_value(&ClientConfigKey::Timeout).unwrap(),
