@@ -37,10 +37,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::CopyOptions;
 use crate::client::CredentialProvider;
 use crate::gcp::credential::GCSAuthorizer;
 use crate::signer::Signer;
-use crate::{CopyMode, CopyOptions};
 use crate::{
     GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart, multipart::PartId,
