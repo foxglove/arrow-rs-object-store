@@ -221,10 +221,7 @@ impl ObjectStore for GoogleCloudStorage {
             extensions: _,
         } = options;
 
-        match mode {
-            CopyMode::Overwrite => self.client.copy_request(from, to, true).await,
-            CopyMode::Create => self.client.copy_request(from, to, false).await,
-        }
+        self.client.copy_request(from, to, mode).await
     }
 }
 
