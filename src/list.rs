@@ -47,11 +47,50 @@ pub struct PaginatedListOptions {
     /// used a different prefix or options
     pub page_token: Option<String>,
 
+    /// How to handle listed keys that have no [`Path`] representation
+    ///
+    /// Defaults to [`InvalidKeyHandling::Error`].
+    ///
+    /// [`Path`]: crate::path::Path
+    pub invalid_keys: InvalidKeyHandling,
+
     /// Implementation-specific extensions. Intended for use by implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// These extensions are ignored entirely by backends offered through this crate.
     pub extensions: http::Extensions,
+}
+
+/// How to handle a listing entry whose key cannot be parsed as a [`Path`]
+///
+/// Stores accept keys that [`Path`] cannot represent, such as those containing
+/// empty segments (`a//b`), relative segments (`a/../b`), or ASCII control
+/// characters. This controls what a paginated list request does when it
+/// encounters one.
+///
+/// [`Path`]: crate::path::Path
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidKeyHandling {
+    /// Fail the request
+    #[default]
+    Error,
+
+    /// Omit the entry from the results, reporting it in
+    /// [`PaginatedListResult::invalid_keys`]
+    Skip,
+}
+
+/// A key omitted from a listing because it has no [`Path`] representation
+///
+/// [`Path`]: crate::path::Path
+#[derive(Debug)]
+pub struct InvalidKey {
+    /// The key as the store returned it
+    pub key: String,
+    /// Why the key could not be parsed as a [`Path`]
+    ///
+    /// [`Path`]: crate::path::Path
+    pub source: crate::path::Error,
 }
 
 /// A [`ListResult`] with optional pagination token
@@ -61,6 +100,14 @@ pub struct PaginatedListResult {
     pub result: ListResult,
     /// If result set truncated, the pagination token to fetch next results
     pub page_token: Option<String>,
+    /// Objects and common prefixes omitted from `result` because their keys
+    /// have no [`Path`] representation
+    ///
+    /// Only populated when [`PaginatedListOptions::invalid_keys`] is
+    /// [`InvalidKeyHandling::Skip`]; always empty otherwise.
+    ///
+    /// [`Path`]: crate::path::Path
+    pub invalid_keys: Vec<InvalidKey>,
 }
 
 /// A low-level interface for interacting with paginated listing APIs

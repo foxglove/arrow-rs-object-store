@@ -22,7 +22,7 @@ use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::s3::{
     CompleteMultipartUpload, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
-    ListResponse,
+    ListResponse, to_list_result,
 };
 use crate::client::{CryptoProvider, GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::gcp::credential::CredentialExt;
@@ -32,7 +32,7 @@ use crate::multipart::PartId;
 use crate::path::Path;
 use crate::util::hex_encode;
 use crate::{
-    Attribute, Attributes, ClientOptions, CopyMode, GetOptions, ListResult, MultipartId, PutMode,
+    Attribute, Attributes, ClientOptions, CopyMode, GetOptions, MultipartId, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, RetryConfig,
 };
 use async_trait::async_trait;
@@ -675,6 +675,9 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
         let credential = self.get_credential().await?;
         let url = format!("{}/{}", self.config.base_url, self.bucket_name_encoded);
 
+        // Read before `opts.extensions` is moved into the request builder
+        let invalid_key_handling = opts.invalid_keys;
+
         let mut query = Vec::with_capacity(5);
         query.push(("list-type", "2"));
         if let Some(delimiter) = &opts.delimiter {
@@ -725,12 +728,13 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
 
         let token = response.next_continuation_token.take();
 
-        let mut result: ListResult = response.try_into()?;
+        let (mut result, invalid_keys) = to_list_result(response, invalid_key_handling)?;
         result.extensions = parts.extensions;
 
         Ok(PaginatedListResult {
             result,
             page_token: token,
+            invalid_keys,
         })
     }
 }
