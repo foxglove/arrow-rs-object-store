@@ -1124,6 +1124,8 @@ mod tests {
             encryption_headers: Default::default(),
             request_payer: false,
             crypto: None,
+            multipart_copy_threshold: 5 * 1024 * 1024 * 1024,
+            multipart_copy_part_size: 5 * 1024 * 1024 * 1024,
         };
 
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
@@ -1181,6 +1183,8 @@ mod tests {
             conditional_put: Default::default(),
             encryption_headers: Default::default(),
             request_payer: false,
+            multipart_copy_threshold: 5 * 1024 * 1024 * 1024,
+            multipart_copy_part_size: 5 * 1024 * 1024 * 1024,
         }
     }
 
