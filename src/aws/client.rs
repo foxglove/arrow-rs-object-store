@@ -30,7 +30,7 @@ use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::s3::{
     CompleteMultipartUpload, CompleteMultipartUploadResult, CopyPartResult,
-    InitiateMultipartUploadResult, ListResponse, PartMetadata,
+    InitiateMultipartUploadResult, ListResponse, PartMetadata, to_list_result,
 };
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
@@ -929,6 +929,9 @@ impl ListClient for Arc<S3Client> {
         let credential = self.config.get_session_credential().await?;
         let url = self.config.bucket_endpoint.clone();
 
+        // Read before `opts.extensions` is moved into the request builder
+        let invalid_key_handling = opts.invalid_keys;
+
         let mut query = Vec::with_capacity(4);
 
         if let Some(token) = &opts.page_token {
@@ -974,9 +977,12 @@ impl ListClient for Arc<S3Client> {
 
         let token = response.next_continuation_token.take();
 
+        let (result, invalid_keys) = to_list_result(response, invalid_key_handling)?;
+
         Ok(PaginatedListResult {
-            result: response.try_into()?,
+            result,
             page_token: token,
+            invalid_keys,
         })
     }
 }
@@ -993,6 +999,7 @@ mod tests {
     use crate::client::get::GetClient;
     use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryContext;
+    use crate::list::{InvalidKeyHandling, PaginatedListStore};
     use http::Response;
     use http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use hyper::Request;
@@ -1159,6 +1166,94 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    /// Build an `AmazonS3` via the public builder so the test drives the same
+    /// `PaginatedListStore` entry point callers use.
+    fn make_store(mock: &MockServer) -> crate::aws::AmazonS3 {
+        crate::aws::AmazonS3Builder::new()
+            .with_endpoint(mock.url())
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .build()
+            .unwrap()
+    }
+
+    /// A truncated page holding one representable key and one that `Path` cannot
+    /// represent.
+    const LIST_PAGE_WITH_INVALID_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ListBucketResult>
+    <Name>test-bucket</Name>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>token-abc</NextContinuationToken>
+    <Contents>
+        <Key>logs/a.mcap</Key>
+        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+        <Size>100</Size>
+    </Contents>
+    <Contents>
+        <Key>logs//b.mcap</Key>
+        <LastModified>2024-01-02T00:00:00.000Z</LastModified>
+        <Size>200</Size>
+    </Contents>
+</ListBucketResult>";
+
+    #[tokio::test]
+    async fn test_list_paginated_invalid_key_error() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(LIST_PAGE_WITH_INVALID_KEY.to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock);
+        let err = store
+            .list_paginated(Some("logs/"), PaginatedListOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_paginated_invalid_key_skip() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(LIST_PAGE_WITH_INVALID_KEY.to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock);
+        let result = store
+            .list_paginated(
+                Some("logs/"),
+                PaginatedListOptions {
+                    invalid_keys: InvalidKeyHandling::Skip,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The valid entry is returned, and the continuation token survives the page
+        // that skipped an entry — so a scan can advance past the bad key.
+        assert_eq!(result.result.objects.len(), 1);
+        assert_eq!(result.result.objects[0].location.as_ref(), "logs/a.mcap");
+        assert_eq!(result.page_token.as_deref(), Some("token-abc"));
+
+        assert_eq!(result.invalid_keys.len(), 1);
+        assert_eq!(result.invalid_keys[0].key, "logs//b.mcap");
         mock.shutdown().await;
     }
 }

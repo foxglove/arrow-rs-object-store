@@ -21,10 +21,10 @@ use crate::azure::{AzureCredentialProvider, STORE};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::get::GetClient;
 use crate::client::header::{HeaderConfig, get_put_result};
-use crate::client::list::ListClient;
+use crate::client::list::{ListClient, parse_key};
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpRequest, HttpResponse};
-use crate::list::{PaginatedListOptions, PaginatedListResult};
+use crate::list::{InvalidKey, InvalidKeyHandling, PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::util::{GetRange, deserialize_rfc1123};
 use crate::{
@@ -942,6 +942,9 @@ impl ListClient for Arc<AzureClient> {
         let credential = self.get_credential().await?;
         let url = self.config.path_url(&Path::default());
 
+        // Read before `opts.extensions` is moved into the request builder
+        let invalid_key_handling = opts.invalid_keys;
+
         let mut query = Vec::with_capacity(6);
         query.push(("restype", "container"));
         query.push(("comp", "list"));
@@ -1007,9 +1010,12 @@ impl ListClient for Arc<AzureClient> {
             }
         }
 
+        let (result, invalid_keys) = to_list_result(response, prefix, invalid_key_handling)?;
+
         Ok(PaginatedListResult {
-            result: to_list_result(response, prefix)?,
+            result,
             page_token: token,
+            invalid_keys,
         })
     }
 }
@@ -1025,13 +1031,21 @@ struct ListResultInternal {
     pub blobs: Blobs,
 }
 
-fn to_list_result(value: ListResultInternal, prefix: Option<&str>) -> Result<ListResult> {
+/// Converts a list response into a [`ListResult`], along with the entries omitted
+/// from it under [`InvalidKeyHandling::Skip`]
+fn to_list_result(
+    value: ListResultInternal,
+    prefix: Option<&str>,
+    handling: InvalidKeyHandling,
+) -> Result<(ListResult, Vec<InvalidKey>)> {
     let prefix = prefix.unwrap_or_default();
+    let mut invalid_keys = Vec::new();
+
     let common_prefixes = value
         .blobs
         .blob_prefix
         .into_iter()
-        .map(|x| Ok(Path::parse(x.name)?))
+        .filter_map(|x| parse_key(x.name, handling, &mut invalid_keys).transpose())
         .collect::<Result<_>>()?;
 
     let objects = value
@@ -1041,17 +1055,23 @@ fn to_list_result(value: ListResultInternal, prefix: Option<&str>) -> Result<Lis
         // Note: Filters out directories from list results when hierarchical namespaces are
         // enabled. When we want directories, its always via the BlobPrefix mechanics,
         // and during lists we state that prefixes are evaluated on path segment basis.
+        //
+        // Note: this filter runs ahead of key parsing so that filtered blobs are never
+        // reported as invalid keys.
         .filter(|blob| {
             !matches!(blob.properties.resource_type.as_ref(), Some(typ) if typ == "directory")
                 && blob.name.len() > prefix.len()
         })
-        .map(ObjectMeta::try_from)
+        .filter_map(|x| to_object_meta(x, handling, &mut invalid_keys).transpose())
         .collect::<Result<_>>()?;
 
-    Ok(ListResult {
-        common_prefixes,
-        objects,
-    })
+    Ok((
+        ListResult {
+            common_prefixes,
+            objects,
+        },
+        invalid_keys,
+    ))
 }
 
 /// Collection of blobs and potentially shared prefixes returned from list requests.
@@ -1083,18 +1103,23 @@ struct Blob {
     pub metadata: Option<HashMap<String, String>>,
 }
 
-impl TryFrom<Blob> for ObjectMeta {
-    type Error = crate::Error;
+/// Returns `Ok(None)` if the blob's name was skipped, see [`parse_key`]
+fn to_object_meta(
+    value: Blob,
+    handling: InvalidKeyHandling,
+    invalid_keys: &mut Vec<InvalidKey>,
+) -> Result<Option<ObjectMeta>> {
+    let Some(location) = parse_key(value.name, handling, invalid_keys)? else {
+        return Ok(None);
+    };
 
-    fn try_from(value: Blob) -> Result<Self> {
-        Ok(Self {
-            location: Path::parse(value.name)?,
-            last_modified: value.properties.last_modified,
-            size: value.properties.content_length,
-            e_tag: value.properties.e_tag,
-            version: None, // For consistency with S3 and GCP which don't include this
-        })
-    }
+    Ok(Some(ObjectMeta {
+        location,
+        last_modified: value.properties.last_modified,
+        size: value.properties.content_length,
+        e_tag: value.properties.e_tag,
+        version: None, // For consistency with S3 and GCP which don't include this
+    }))
 }
 
 /// Properties associated with individual blobs. The actual list
@@ -1337,6 +1362,117 @@ mod tests {
 </EnumerationResults>";
 
         let _list_blobs_response_internal: ListResultInternal = quick_xml::de::from_str(S).unwrap();
+    }
+
+    /// A page mixing representable names with ones `Path` cannot represent: an empty
+    /// segment, a relative segment, and an ASCII control character. `BlobPrefix` holds
+    /// one of each kind too, and a hierarchical-namespace directory blob is present to
+    /// confirm it is filtered rather than reported as invalid.
+    const INVALID_KEY_LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<EnumerationResults>
+    <Prefix>logs/</Prefix>
+    <Delimiter>/</Delimiter>
+    <Blobs>
+        <BlobPrefix>
+            <Name>logs/good/</Name>
+        </BlobPrefix>
+        <BlobPrefix>
+            <Name>bad//prefix/</Name>
+        </BlobPrefix>
+        <Blob>
+            <Name>logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Etag>0x8D93C7D4629C227</Etag>
+                <Content-Length>100</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs//b.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>200</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/../c.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>300</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/d\u{7}.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>400</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs//dir</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>0</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+                <ResourceType>directory</ResourceType>
+            </Properties>
+        </Blob>
+    </Blobs>
+    <NextMarker>marker-abc</NextMarker>
+</EnumerationResults>";
+
+    fn parse_invalid_key_list_response() -> ListResultInternal {
+        quick_xml::de::from_str(INVALID_KEY_LIST_RESPONSE).unwrap()
+    }
+
+    #[test]
+    fn list_result_error_on_invalid_key() {
+        let response = parse_invalid_key_list_response();
+        let err = to_list_result(response, Some("logs/"), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_result_skip_invalid_key() {
+        let response = parse_invalid_key_list_response();
+        let token = response.next_marker.clone();
+
+        let (result, invalid_keys) =
+            to_list_result(response, Some("logs/"), InvalidKeyHandling::Skip).unwrap();
+
+        // The continuation token survives a page that skipped entries
+        assert_eq!(token.as_deref(), Some("marker-abc"));
+
+        let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
+        assert_eq!(objects, vec!["logs/a.mcap"]);
+        assert_eq!(result.objects[0].size, 100);
+        assert_eq!(
+            result.objects[0].e_tag.as_deref(),
+            Some("0x8D93C7D4629C227")
+        );
+
+        let prefixes: Vec<_> = result.common_prefixes.iter().map(|x| x.as_ref()).collect();
+        assert_eq!(prefixes, vec!["logs/good"]);
+
+        // Raw names are reported verbatim, prefixes ahead of objects. `logs//dir` is
+        // filtered as a directory before parsing, so it is absent despite being invalid.
+        let keys: Vec<_> = invalid_keys.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "bad//prefix/",
+                "logs//b.mcap",
+                "logs/../c.mcap",
+                "logs/d\u{7}.mcap",
+            ]
+        );
     }
 
     #[test]
