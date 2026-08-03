@@ -17,7 +17,7 @@
 
 use crate::Result;
 use crate::client::pagination::stream_paginated;
-use crate::list::{PaginatedListOptions, PaginatedListResult};
+use crate::list::{InvalidKey, InvalidKeyHandling, PaginatedListOptions, PaginatedListResult};
 use crate::path::{DELIMITER, Path};
 use crate::{ListResult, ObjectMeta};
 use async_trait::async_trait;
@@ -25,6 +25,27 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+
+/// Parses a key returned by a list request into a [`Path`]
+///
+/// Returns `Ok(None)` if the key has no `Path` representation and `handling` is
+/// [`InvalidKeyHandling::Skip`], having recorded the raw key in `invalid_keys`.
+pub(crate) fn parse_key(
+    key: String,
+    handling: InvalidKeyHandling,
+    invalid_keys: &mut Vec<InvalidKey>,
+) -> Result<Option<Path>> {
+    match Path::parse(&key) {
+        Ok(path) => Ok(Some(path)),
+        Err(source) => match handling {
+            InvalidKeyHandling::Error => Err(source.into()),
+            InvalidKeyHandling::Skip => {
+                invalid_keys.push(InvalidKey { key, source });
+                Ok(None)
+            }
+        },
+    }
+}
 
 /// A client that can perform paginated list requests
 #[async_trait]
