@@ -1256,8 +1256,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A truncated page holding one representable key and one that `Path` cannot
-    /// represent.
+    /// A truncated page holding one representable key, one that `Path` cannot
+    /// represent, and one that `Path::parse` would silently normalize.
     const LIST_PAGE_WITH_INVALID_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <ListBucketResult>
     <Name>test-bucket</Name>
@@ -1272,6 +1272,11 @@ mod tests {
         <Key>logs//b.mcap</Key>
         <LastModified>2024-01-02T00:00:00.000Z</LastModified>
         <Size>200</Size>
+    </Contents>
+    <Contents>
+        <Key>/logs/c.mcap</Key>
+        <LastModified>2024-01-03T00:00:00.000Z</LastModified>
+        <Size>300</Size>
     </Contents>
 </ListBucketResult>";
 
@@ -1326,8 +1331,10 @@ mod tests {
         assert_eq!(result.result.objects[0].location.as_ref(), "logs/a.mcap");
         assert_eq!(result.page_token.as_deref(), Some("token-abc"));
 
-        assert_eq!(result.invalid_keys.len(), 1);
-        assert_eq!(result.invalid_keys[0].key, "logs//b.mcap");
+        // Both the unrepresentable key and the one that would only parse after
+        // normalization are reported verbatim
+        let keys: Vec<_> = result.invalid_keys.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(keys, vec!["logs//b.mcap", "/logs/c.mcap"]);
         mock.shutdown().await;
     }
 
