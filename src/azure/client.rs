@@ -1480,6 +1480,32 @@ mod tests {
         );
     }
 
+    /// A leading `/` alone is enough to fail the page under [`InvalidKeyHandling::Error`]
+    #[test]
+    fn list_result_error_on_non_normalized_key() {
+        const RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<EnumerationResults>
+    <Prefix>logs/</Prefix>
+    <Blobs>
+        <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>100</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+    </Blobs>
+</EnumerationResults>";
+
+        let response: ListResultInternal = quick_xml::de::from_str(RESPONSE).unwrap();
+        let err = to_list_result(response, Some("logs/"), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A failed list request must be classified by status, not flattened into `Generic`
     #[test]
     fn list_request_error_is_typed() {

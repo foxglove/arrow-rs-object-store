@@ -28,6 +28,11 @@ use std::collections::BTreeSet;
 
 /// Parses a key returned by a list request into a [`Path`]
 ///
+/// A key with a leading `/` is treated as invalid rather than normalized: [`Path::parse`]
+/// would strip the slash and succeed, reporting the object under a name that does not
+/// address it. A *trailing* `/` is still stripped and accepted, as such keys are
+/// overwhelmingly zero-byte directory markers, for which normalization is harmless.
+///
 /// Returns `Ok(None)` if the key has no `Path` representation and `handling` is
 /// [`InvalidKeyHandling::Skip`], having recorded the raw key in `invalid_keys`.
 pub(crate) fn parse_key(
@@ -35,15 +40,18 @@ pub(crate) fn parse_key(
     handling: InvalidKeyHandling,
     invalid_keys: &mut Vec<InvalidKey>,
 ) -> Result<Option<Path>> {
-    match Path::parse(&key) {
-        Ok(path) => Ok(Some(path)),
-        Err(source) => match handling {
-            InvalidKeyHandling::Error => Err(source.into()),
-            InvalidKeyHandling::Skip => {
-                invalid_keys.push(InvalidKey { key, source });
-                Ok(None)
-            }
-        },
+    let source = match Path::parse(&key) {
+        Ok(path) if !key.starts_with(DELIMITER) => return Ok(Some(path)),
+        Ok(_) => crate::path::Error::NotNormalized { path: key.clone() },
+        Err(source) => source,
+    };
+
+    match handling {
+        InvalidKeyHandling::Error => Err(source.into()),
+        InvalidKeyHandling::Skip => {
+            invalid_keys.push(InvalidKey { key, source });
+            Ok(None)
+        }
     }
 }
 

@@ -175,13 +175,14 @@ mod tests {
     use super::*;
 
     /// A page mixing representable keys with ones `Path` cannot represent: an empty
-    /// segment, a relative segment, and an ASCII control character. `CommonPrefixes`
-    /// holds one of each kind too.
+    /// segment, a relative segment, an ASCII control character, and a leading `/`
+    /// (which `Path::parse` would strip). A trailing `/` is normalized, not rejected.
+    /// `CommonPrefixes` holds one of each kind too.
     const LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <ListBucketResult>
     <Name>bucket</Name>
     <Prefix>logs/</Prefix>
-    <KeyCount>4</KeyCount>
+    <KeyCount>6</KeyCount>
     <MaxKeys>1000</MaxKeys>
     <Delimiter>/</Delimiter>
     <IsTruncated>true</IsTruncated>
@@ -209,6 +210,18 @@ mod tests {
         <LastModified>2024-01-04T00:00:00.000Z</LastModified>
         <ETag>\"etag-d\"</ETag>
         <Size>400</Size>
+    </Contents>
+    <Contents>
+        <Key>/logs/a.mcap</Key>
+        <LastModified>2024-01-05T00:00:00.000Z</LastModified>
+        <ETag>\"etag-e\"</ETag>
+        <Size>500</Size>
+    </Contents>
+    <Contents>
+        <Key>logs/</Key>
+        <LastModified>2024-01-06T00:00:00.000Z</LastModified>
+        <ETag>\"etag-f\"</ETag>
+        <Size>0</Size>
     </Contents>
     <CommonPrefixes>
         <Prefix>logs/good/</Prefix>
@@ -241,8 +254,9 @@ mod tests {
         // The continuation token survives a page that skipped entries
         assert_eq!(token.as_deref(), Some("token-abc"));
 
+        // A trailing `/` is still normalized away rather than reported invalid
         let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
-        assert_eq!(objects, vec!["logs/a.mcap"]);
+        assert_eq!(objects, vec!["logs/a.mcap", "logs"]);
         assert_eq!(result.objects[0].size, 100);
         assert_eq!(result.objects[0].e_tag.as_deref(), Some("\"etag-a\""));
 
@@ -258,7 +272,37 @@ mod tests {
                 "logs//b.mcap",
                 "logs/../c.mcap",
                 "logs/d\u{7}.mcap",
+                "/logs/a.mcap",
             ]
+        );
+
+        // The leading-slash key is reported as non-normalizable, not as a parse failure
+        let source = &invalid_keys.last().unwrap().source;
+        assert!(
+            matches!(source, crate::path::Error::NotNormalized { path } if path == "/logs/a.mcap"),
+            "unexpected source: {source}"
+        );
+    }
+
+    /// A leading `/` alone is enough to fail the page under [`InvalidKeyHandling::Error`]
+    #[test]
+    fn list_result_error_on_non_normalized_key() {
+        const RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ListBucketResult>
+    <Name>bucket</Name>
+    <Contents>
+        <Key>/logs/a.mcap</Key>
+        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+        <ETag>\"etag-a\"</ETag>
+        <Size>100</Size>
+    </Contents>
+</ListBucketResult>";
+
+        let response: ListResponse = quick_xml::de::from_str(RESPONSE).unwrap();
+        let err = to_list_result(response, InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
         );
     }
 }
