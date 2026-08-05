@@ -107,6 +107,8 @@ pub(crate) enum Error {
     #[error("Error performing list request: {}", source)]
     ListRequest {
         source: crate::client::retry::RetryError,
+        /// The prefix that was being listed, used only for error classification
+        path: String,
     },
 
     #[error("Error getting list response body: {}", source)]
@@ -144,9 +146,9 @@ pub(crate) enum Error {
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::GetRequest { source, path } | Error::PutRequest { source, path } => {
-                source.error(STORE, path)
-            }
+            Error::GetRequest { source, path }
+            | Error::PutRequest { source, path }
+            | Error::ListRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -986,7 +988,10 @@ impl ListClient for Arc<AzureClient> {
             .sensitive(sensitive)
             .send()
             .await
-            .map_err(|source| Error::ListRequest { source })?
+            .map_err(|source| Error::ListRequest {
+                source,
+                path: prefix.unwrap_or_default().to_string(),
+            })?
             .into_body()
             .bytes()
             .await
@@ -1365,9 +1370,10 @@ mod tests {
     }
 
     /// A page mixing representable names with ones `Path` cannot represent: an empty
-    /// segment, a relative segment, and an ASCII control character. `BlobPrefix` holds
-    /// one of each kind too, and a hierarchical-namespace directory blob is present to
-    /// confirm it is filtered rather than reported as invalid.
+    /// segment, a relative segment, an ASCII control character, and a leading `/`
+    /// (which `Path::parse` would strip). A trailing `/` is normalized, not rejected.
+    /// `BlobPrefix` holds one of each kind too, and a hierarchical-namespace directory
+    /// blob is present to confirm it is filtered rather than reported as invalid.
     const INVALID_KEY_LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <EnumerationResults>
     <Prefix>logs/</Prefix>
@@ -1413,6 +1419,22 @@ mod tests {
             </Properties>
         </Blob>
         <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>500</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/sub/</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>0</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
             <Name>logs//dir</Name>
             <Properties>
                 <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
@@ -1450,8 +1472,9 @@ mod tests {
         // The continuation token survives a page that skipped entries
         assert_eq!(token.as_deref(), Some("marker-abc"));
 
+        // A trailing `/` is still normalized away rather than reported invalid
         let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
-        assert_eq!(objects, vec!["logs/a.mcap"]);
+        assert_eq!(objects, vec!["logs/a.mcap", "logs/sub"]);
         assert_eq!(result.objects[0].size, 100);
         assert_eq!(
             result.objects[0].e_tag.as_deref(),
@@ -1471,8 +1494,46 @@ mod tests {
                 "logs//b.mcap",
                 "logs/../c.mcap",
                 "logs/d\u{7}.mcap",
+                "/logs/a.mcap",
             ]
         );
+
+        // The leading-slash name is reported as non-normalizable, not as a parse failure
+        let source = &invalid_keys.last().unwrap().source;
+        assert!(
+            matches!(source, crate::path::Error::NotNormalized { path } if path == "/logs/a.mcap"),
+            "unexpected source: {source}"
+        );
+    }
+
+    /// A failed list request must be classified by status, not flattened into `Generic`
+    #[test]
+    fn list_request_error_is_typed() {
+        use crate::client::retry::RetryError;
+        use reqwest::StatusCode;
+
+        let classify = |status| {
+            let source = RetryError::from_status(status);
+            let path = "logs/".to_string();
+            crate::Error::from(Error::ListRequest { source, path })
+        };
+
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN),
+            crate::Error::PermissionDenied { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED),
+            crate::Error::Unauthenticated { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::NOT_FOUND),
+            crate::Error::NotFound { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            crate::Error::Generic { .. }
+        ));
     }
 
     #[test]

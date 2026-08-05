@@ -154,6 +154,20 @@ impl RetryError {
         }
     }
 
+    /// Constructs a [`RetryError`] for a request that failed with `status`
+    #[cfg(all(test, any(feature = "aws", feature = "gcp", feature = "azure")))]
+    pub(crate) fn from_status(status: StatusCode) -> Self {
+        Self(Box::new(RetryErrorImpl {
+            method: Method::GET,
+            uri: None,
+            retries: 0,
+            max_retries: 0,
+            elapsed: Duration::from_secs(0),
+            retry_timeout: Duration::from_secs(0),
+            inner: RequestError::Status { status, body: None },
+        }))
+    }
+
     pub fn error(self, store: &'static str, path: String) -> crate::Error {
         match self.status() {
             Some(StatusCode::NOT_FOUND) => crate::Error::NotFound {

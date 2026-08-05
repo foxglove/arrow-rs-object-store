@@ -60,6 +60,8 @@ enum Error {
     #[error("Error performing list request: {}", source)]
     ListRequest {
         source: crate::client::retry::RetryError,
+        /// The prefix that was being listed, used only for error classification
+        path: String,
     },
 
     #[error("Error getting list response body: {}", source)]
@@ -123,9 +125,9 @@ enum Error {
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::GetRequest { source, path } | Error::Request { source, path } => {
-                source.error(STORE, path)
-            }
+            Error::GetRequest { source, path }
+            | Error::Request { source, path }
+            | Error::ListRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -708,7 +710,10 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
             .with_bearer_auth(credential.as_deref())
             .send_retry(&self.config.retry_config)
             .await
-            .map_err(|source| Error::ListRequest { source })?
+            .map_err(|source| Error::ListRequest {
+                source,
+                path: prefix.unwrap_or_default().to_string(),
+            })?
             .into_body()
             .bytes()
             .await
@@ -726,5 +731,39 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
             page_token: token,
             invalid_keys,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::retry::RetryError;
+    use reqwest::StatusCode;
+
+    /// A failed list request must be classified by status, not flattened into `Generic`
+    #[test]
+    fn list_request_error_is_typed() {
+        let classify = |status| {
+            let source = RetryError::from_status(status);
+            let path = "logs/".to_string();
+            crate::Error::from(Error::ListRequest { source, path })
+        };
+
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN),
+            crate::Error::PermissionDenied { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED),
+            crate::Error::Unauthenticated { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::NOT_FOUND),
+            crate::Error::NotFound { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            crate::Error::Generic { .. }
+        ));
     }
 }
