@@ -392,7 +392,7 @@ fn string_to_sign_service_sas(
         "",                               // signed identifier
         "",                               // signed ip
         "",                               // signed protocol
-        &AZURE_VERSION.to_str().unwrap(), // signed version
+        AZURE_VERSION.to_str().unwrap(), // signed version
         signed_resource,                  // signed resource
         "",                               // signed snapshot time
         "",                               // signed encryption scope
@@ -444,7 +444,7 @@ fn string_to_sign_user_delegation_sas(
         "",                               // signed correlation id
         "",                               // signed ip
         "",                               // signed protocol
-        &AZURE_VERSION.to_str().unwrap(), // signed version
+        AZURE_VERSION.to_str().unwrap(), // signed version
         signed_resource,                  // signed resource
         "",                               // signed snapshot time
         "",                               // signed encryption scope
