@@ -95,6 +95,8 @@ pub(crate) enum Error {
     #[error("Error performing list request: {}", source)]
     ListRequest {
         source: crate::client::retry::RetryError,
+        /// The prefix that was being listed, used only for error classification
+        path: String,
     },
 
     #[error("Error getting list response body: {}", source)]
@@ -129,6 +131,7 @@ impl From<Error> for crate::Error {
         match err {
             Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
             Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
+            Error::ListRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -811,9 +814,9 @@ impl S3Client {
             .body(body)
             .with_aws_sigv4(credential.authorizer(), None);
 
-        let request = match mode {
-            CompleteMultipartMode::Overwrite => request,
-            CompleteMultipartMode::Create => request.header("If-None-Match", "*"),
+        let (request, is_create) = match mode {
+            CompleteMultipartMode::Overwrite => (request, false),
+            CompleteMultipartMode::Create => (request.header("If-None-Match", "*"), true),
         };
 
         let response = request
@@ -822,9 +825,16 @@ impl S3Client {
             .retry_error_body(true)
             .send()
             .await
-            .map_err(|source| Error::CompleteMultipartRequest {
-                source,
-                path: location.as_ref().to_string(),
+            .map_err(|source| {
+                let path = location.as_ref().to_string();
+                if is_create && source.status() == Some(http::StatusCode::PRECONDITION_FAILED) {
+                    crate::Error::AlreadyExists {
+                        source: Box::new(source),
+                        path,
+                    }
+                } else {
+                    crate::Error::from(Error::CompleteMultipartRequest { source, path })
+                }
             })?;
 
         let version = get_version(response.headers(), VERSION_HEADER)
@@ -966,7 +976,10 @@ impl ListClient for Arc<S3Client> {
             .with_aws_sigv4(credential.authorizer(), None)
             .send_retry(&self.config.retry_config)
             .await
-            .map_err(|source| Error::ListRequest { source })?
+            .map_err(|source| Error::ListRequest {
+                source,
+                path: prefix.unwrap_or_default().to_string(),
+            })?
             .into_body()
             .bytes()
             .await
@@ -998,12 +1011,40 @@ mod tests {
     use crate::client::HttpClient;
     use crate::client::get::GetClient;
     use crate::client::mock_server::MockServer;
-    use crate::client::retry::RetryContext;
+    use crate::client::retry::{RetryContext, RetryError};
     use crate::list::{InvalidKeyHandling, PaginatedListStore};
     use http::Response;
     use http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use hyper::Request;
     use hyper::body::Incoming;
+    use reqwest::StatusCode;
+
+    /// A failed list request must be classified by status, not flattened into `Generic`
+    #[test]
+    fn list_request_error_is_typed() {
+        let classify = |status| {
+            let source = RetryError::from_status(status);
+            let path = "logs/".to_string();
+            crate::Error::from(Error::ListRequest { source, path })
+        };
+
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN),
+            crate::Error::PermissionDenied { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED),
+            crate::Error::Unauthenticated { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::NOT_FOUND),
+            crate::Error::NotFound { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            crate::Error::Generic { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn test_create_multipart_has_content_length() {
@@ -1052,6 +1093,39 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap(), "test-upload-id");
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_create_existing_object() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get("if-none-match").unwrap(), "*");
+            Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let parts = vec![PartId {
+            content_id: "\"part-etag\"".to_string(),
+        }];
+        let err = client
+            .complete_multipart(
+                &Path::from("test"),
+                "test-upload-id",
+                parts,
+                CompleteMultipartMode::Create,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::AlreadyExists { ref path, .. } if path == "test"),
+            "unexpected error: {err}"
+        );
         mock.shutdown().await;
     }
 
@@ -1254,6 +1328,30 @@ mod tests {
 
         assert_eq!(result.invalid_keys.len(), 1);
         assert_eq!(result.invalid_keys[0].key, "logs//b.mcap");
+        mock.shutdown().await;
+    }
+
+    /// A list that fails must surface a typed error naming the prefix, not `Generic`
+    #[tokio::test]
+    async fn test_list_paginated_forbidden() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(403)
+                .body("<Error><Code>AccessDenied</Code></Error>".to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock);
+        let err = store
+            .list_paginated(Some("logs/"), PaginatedListOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::PermissionDenied { ref path, .. } if path == "logs/"),
+            "unexpected error: {err}"
+        );
         mock.shutdown().await;
     }
 }
