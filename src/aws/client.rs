@@ -814,9 +814,9 @@ impl S3Client {
             .body(body)
             .with_aws_sigv4(credential.authorizer(), None);
 
-        let request = match mode {
-            CompleteMultipartMode::Overwrite => request,
-            CompleteMultipartMode::Create => request.header("If-None-Match", "*"),
+        let (request, is_create) = match mode {
+            CompleteMultipartMode::Overwrite => (request, false),
+            CompleteMultipartMode::Create => (request.header("If-None-Match", "*"), true),
         };
 
         let response = request
@@ -825,9 +825,16 @@ impl S3Client {
             .retry_error_body(true)
             .send()
             .await
-            .map_err(|source| Error::CompleteMultipartRequest {
-                source,
-                path: location.as_ref().to_string(),
+            .map_err(|source| {
+                let path = location.as_ref().to_string();
+                if is_create && source.status() == Some(http::StatusCode::PRECONDITION_FAILED) {
+                    crate::Error::AlreadyExists {
+                        source: Box::new(source),
+                        path,
+                    }
+                } else {
+                    crate::Error::from(Error::CompleteMultipartRequest { source, path })
+                }
             })?;
 
         let version = get_version(response.headers(), VERSION_HEADER)
@@ -1086,6 +1093,39 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap(), "test-upload-id");
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_create_existing_object() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get("if-none-match").unwrap(), "*");
+            Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let parts = vec![PartId {
+            content_id: "\"part-etag\"".to_string(),
+        }];
+        let err = client
+            .complete_multipart(
+                &Path::from("test"),
+                "test-upload-id",
+                parts,
+                CompleteMultipartMode::Create,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::AlreadyExists { ref path, .. } if path == "test"),
+            "unexpected error: {err}"
+        );
         mock.shutdown().await;
     }
 
