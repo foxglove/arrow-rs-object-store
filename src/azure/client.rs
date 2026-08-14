@@ -1370,9 +1370,10 @@ mod tests {
     }
 
     /// A page mixing representable names with ones `Path` cannot represent: an empty
-    /// segment, a relative segment, and an ASCII control character. `BlobPrefix` holds
-    /// one of each kind too, and a hierarchical-namespace directory blob is present to
-    /// confirm it is filtered rather than reported as invalid.
+    /// segment, a relative segment, an ASCII control character, and a leading `/`
+    /// (which `Path::parse` would strip). A trailing `/` is normalized, not rejected.
+    /// `BlobPrefix` holds one of each kind too, and a hierarchical-namespace directory
+    /// blob is present to confirm it is filtered rather than reported as invalid.
     const INVALID_KEY_LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <EnumerationResults>
     <Prefix>logs/</Prefix>
@@ -1418,6 +1419,22 @@ mod tests {
             </Properties>
         </Blob>
         <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>500</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/sub/</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>0</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
             <Name>logs//dir</Name>
             <Properties>
                 <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
@@ -1455,8 +1472,9 @@ mod tests {
         // The continuation token survives a page that skipped entries
         assert_eq!(token.as_deref(), Some("marker-abc"));
 
+        // A trailing `/` is still normalized away rather than reported invalid
         let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
-        assert_eq!(objects, vec!["logs/a.mcap"]);
+        assert_eq!(objects, vec!["logs/a.mcap", "logs/sub"]);
         assert_eq!(result.objects[0].size, 100);
         assert_eq!(
             result.objects[0].e_tag.as_deref(),
@@ -1476,7 +1494,41 @@ mod tests {
                 "logs//b.mcap",
                 "logs/../c.mcap",
                 "logs/d\u{7}.mcap",
+                "/logs/a.mcap",
             ]
+        );
+
+        // The leading-slash name is reported as non-normalizable, not as a parse failure
+        let source = &invalid_keys.last().unwrap().source;
+        assert!(
+            matches!(source, crate::path::Error::NotNormalized { path } if path == "/logs/a.mcap"),
+            "unexpected source: {source}"
+        );
+    }
+
+    /// A leading `/` alone is enough to fail the page under [`InvalidKeyHandling::Error`]
+    #[test]
+    fn list_result_error_on_non_normalized_key() {
+        const RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<EnumerationResults>
+    <Prefix>logs/</Prefix>
+    <Blobs>
+        <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>100</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+    </Blobs>
+</EnumerationResults>";
+
+        let response: ListResultInternal = quick_xml::de::from_str(RESPONSE).unwrap();
+        let err = to_list_result(response, Some("logs/"), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
         );
     }
 

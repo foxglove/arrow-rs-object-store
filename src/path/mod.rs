@@ -80,6 +80,17 @@ pub enum Error {
         source: std::str::Utf8Error,
     },
 
+    /// Error when a path is only representable after normalization, e.g. a leading `/`
+    ///
+    /// [`Path::parse`] strips a leading `/`, so such a path parses successfully but
+    /// under a name that does not address the original object. This error is reported
+    /// by list operations, which must not silently rewrite provider keys.
+    #[error("Path \"{}\" is not representable without normalization", path)]
+    NotNormalized {
+        /// The source path
+        path: String,
+    },
+
     /// Error when the a path doesn't start with given prefix
     #[error("Path {} does not start with prefix {}", path, prefix)]
     PrefixMismatch {
