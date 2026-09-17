@@ -25,8 +25,8 @@
 //!
 use crate::{
     CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart,
+    ObjectMeta, ObjectStore, PutMultipartMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result, UploadPart,
     multipart::{MultipartStore, PartId},
     path::Path,
     signer::Signer,
@@ -103,6 +103,12 @@ impl ObjectStore for MicrosoftAzure {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        if opts.mode != PutMultipartMode::Overwrite {
+            return Err(crate::Error::NotImplemented {
+                operation: "`put_multipart_opts` with mode `PutMultipartMode::Create`".into(),
+                implementer: self.to_string(),
+            });
+        }
         Ok(Box::new(AzureMultiPartUpload {
             part_idx: 0,
             opts,

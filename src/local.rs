@@ -39,8 +39,8 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart, maybe_spawn_blocking,
+    ObjectStore, PutMode, PutMultipartMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result, UploadPart, maybe_spawn_blocking,
     path::{Path, absolute_path_to_url},
     util::InvalidGetRange,
 };
@@ -406,6 +406,12 @@ impl ObjectStore for LocalFileSystem {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        if opts.mode != PutMultipartMode::Overwrite {
+            return Err(crate::Error::NotImplemented {
+                operation: "`put_multipart_opts` with mode `PutMultipartMode::Create`".into(),
+                implementer: self.to_string(),
+            });
+        }
         if !opts.attributes.is_empty() {
             return Err(crate::Error::NotImplemented {
                 operation: "`put_multipart_opts` with `opts.attributes` specified".into(),

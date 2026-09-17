@@ -1808,9 +1808,25 @@ impl From<Attributes> for PutOptions {
 #[deprecated(note = "Use PutMultipartOptions", since = "0.12.3")]
 pub type PutMultipartOpts = PutMultipartOptions;
 
+/// The write behavior for a multipart upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PutMultipartMode {
+    /// Replace any existing object when the upload completes.
+    #[default]
+    Overwrite,
+    /// Complete the upload only if the object does not already exist.
+    ///
+    /// Returns [`Error::AlreadyExists`] if another object exists at completion.
+    /// Currently supported only by S3 with conditional writes enabled; other
+    /// backends return [`Error::NotImplemented`] when starting the upload.
+    Create,
+}
+
 /// Options for [`ObjectStore::put_multipart_opts`]
 #[derive(Debug, Clone, Default)]
 pub struct PutMultipartOptions {
+    /// Configure the write behavior when the upload completes.
+    pub mode: PutMultipartMode,
     /// Provide a [`TagSet`] for this object
     ///
     /// Implementations that don't support object tagging should ignore this
@@ -1830,17 +1846,7 @@ pub struct PutMultipartOptions {
 
 impl PartialEq<Self> for PutMultipartOptions {
     fn eq(&self, other: &Self) -> bool {
-        let Self {
-            tags,
-            attributes,
-            extensions: _,
-        } = self;
-        let Self {
-            tags: other_tags,
-            attributes: other_attributes,
-            extensions: _,
-        } = other;
-        (tags == other_tags) && (attributes == other_attributes)
+        self.mode == other.mode && self.tags == other.tags && self.attributes == other.attributes
     }
 }
 
@@ -2163,6 +2169,48 @@ mod tests {
         };
     }
     pub(crate) use maybe_skip_integration;
+
+    #[tokio::test]
+    async fn multipart_create_unsupported() {
+        let stores: Vec<Box<dyn ObjectStore>> = vec![
+            Box::new(memory::InMemory::new()),
+            #[cfg(feature = "fs")]
+            Box::new(local::LocalFileSystem::new()),
+            #[cfg(feature = "azure")]
+            Box::new(
+                azure::MicrosoftAzureBuilder::new()
+                    .with_account("account")
+                    .with_container_name("container")
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ),
+            #[cfg(feature = "gcp")]
+            Box::new(
+                gcp::GoogleCloudStorageBuilder::new()
+                    .with_bucket_name("bucket")
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+        for store in stores {
+            let error = store
+                .put_multipart_opts(
+                    &Path::from("recording.mcap"),
+                    PutMultipartOptions {
+                        mode: PutMultipartMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::NotImplemented { .. }),
+                "{store}: {error}"
+            );
+        }
+    }
 
     /// Test that the returned stream does not borrow the lifetime of Path
     fn list_store<'a>(

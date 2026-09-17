@@ -36,8 +36,8 @@ use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::{
-    Attribute, Attributes, ClientOptions, GetOptions, MultipartId, Path, PutMultipartOptions,
-    PutPayload, PutResult, Result, RetryConfig, TagSet,
+    Attribute, Attributes, ClientOptions, GetOptions, MultipartId, Path, PutMultipartMode,
+    PutMultipartOptions, PutPayload, PutResult, Result, RetryConfig, TagSet,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -150,11 +150,6 @@ impl Default for PutPartPayload<'_> {
     fn default() -> Self {
         Self::Part(PutPayload::default())
     }
-}
-
-pub(crate) enum CompleteMultipartMode {
-    Overwrite,
-    Create,
 }
 
 #[derive(Deserialize)]
@@ -655,6 +650,7 @@ impl S3Client {
         opts: PutMultipartOptions,
     ) -> Result<MultipartId> {
         let PutMultipartOptions {
+            mode: _,
             tags,
             attributes,
             extensions,
@@ -784,7 +780,7 @@ impl S3Client {
         location: &Path,
         upload_id: &str,
         parts: Vec<PartId>,
-        mode: CompleteMultipartMode,
+        mode: PutMultipartMode,
     ) -> Result<PutResult> {
         let parts = if parts.is_empty() {
             // If no parts were uploaded, upload an empty part
@@ -815,8 +811,8 @@ impl S3Client {
             .with_aws_sigv4(credential.authorizer(), None);
 
         let request = match mode {
-            CompleteMultipartMode::Overwrite => request,
-            CompleteMultipartMode::Create => request.header("If-None-Match", "*"),
+            PutMultipartMode::Overwrite => request,
+            PutMultipartMode::Create => request.header("If-None-Match", "*"),
         };
 
         let response = request
@@ -1214,6 +1210,145 @@ mod tests {
             .with_skip_signature(true)
             .build()
             .unwrap()
+    }
+
+    async fn mock_multipart_upload(
+        mock: &MockServer,
+        mode: PutMultipartMode,
+    ) -> Box<dyn crate::MultipartUpload> {
+        use crate::ObjectStore;
+
+        mock.push_fn(|request| {
+            assert!(request.uri().query().unwrap().contains("uploads"));
+            assert!(!request.headers().contains_key("if-none-match"));
+            Response::new(
+                "<InitiateMultipartUploadResult><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>".to_string(),
+            )
+        });
+        mock.push_fn(|request| {
+            assert_eq!(request.method(), Method::PUT);
+            assert!(!request.headers().contains_key("if-none-match"));
+            Response::builder()
+                .header("etag", "part-etag")
+                .body(String::new())
+                .unwrap()
+        });
+        let mut upload = make_store(mock)
+            .put_multipart_opts(
+                &Path::from("recording.mcap"),
+                PutMultipartOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        upload
+    }
+
+    #[tokio::test]
+    async fn test_multipart_completion_mode() {
+        for mode in [PutMultipartMode::default(), PutMultipartMode::Create] {
+            let mock = MockServer::new().await;
+            let mut upload = mock_multipart_upload(&mock, mode).await;
+            mock.push_fn(move |request| {
+                assert_eq!(request.method(), Method::POST);
+                assert_eq!(request.uri().query(), Some("uploadId=upload-id"));
+                assert_eq!(
+                    request.headers().get("if-none-match").map(|v| v.to_str().unwrap()),
+                    (mode == PutMultipartMode::Create).then_some("*"),
+                );
+                Response::new(
+                    "<CompleteMultipartUploadResult><ETag>completed-etag</ETag></CompleteMultipartUploadResult>".to_string(),
+                )
+            });
+            let result = upload.complete().await.unwrap();
+            assert_eq!(result.e_tag.as_deref(), Some("completed-etag"));
+            mock.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multipart_create_conflict() {
+        for status in [
+            StatusCode::PRECONDITION_FAILED,
+            StatusCode::NOT_MODIFIED,
+            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
+        ] {
+            let mock = MockServer::new().await;
+            let mut upload = mock_multipart_upload(&mock, PutMultipartMode::Create).await;
+            mock.push_fn(move |request| {
+                assert_eq!(request.headers().get("if-none-match").unwrap(), "*");
+                Response::builder()
+                    .status(status)
+                    .body(String::new())
+                    .unwrap()
+            });
+            let error = upload.complete().await.unwrap_err();
+            if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND) {
+                // Retry with a new upload ID after a conflict or a lost completion response.
+                assert!(matches!(error, crate::Error::Generic { .. }), "{error}");
+            } else {
+                assert!(
+                    matches!(error, crate::Error::AlreadyExists { ref path, .. } if path == "recording.mcap"),
+                    "{error}",
+                );
+            }
+            mock.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_put_conflict() {
+        use crate::{ObjectStore, PutMode, PutOptions};
+
+        let mock = MockServer::new().await;
+        mock.push_fn(|request| {
+            assert_eq!(request.headers().get("if-none-match").unwrap(), "*");
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(String::new())
+                .unwrap()
+        });
+        let error = make_store(&mock)
+            .put_opts(
+                &Path::from("recording.mcap"),
+                "data".into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::Generic { .. }), "{error}");
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_multipart_create_disabled() {
+        use crate::ObjectStore;
+
+        let store = crate::aws::AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_skip_signature(true)
+            .with_conditional_put(S3ConditionalPut::Disabled)
+            .build()
+            .unwrap();
+        let error = store
+            .put_multipart_opts(
+                &Path::from("recording.mcap"),
+                PutMultipartOptions {
+                    mode: PutMultipartMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::NotImplemented { .. }));
     }
 
     /// A truncated page holding one representable key, one that `Path` cannot

@@ -36,7 +36,7 @@ use reqwest::{Method, StatusCode};
 use std::{sync::Arc, time::Duration};
 use url::Url;
 
-use crate::aws::client::{CompleteMultipartMode, PutPartPayload, RequestError, S3Client};
+use crate::aws::client::{PutPartPayload, RequestError, S3Client};
 use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
@@ -45,8 +45,8 @@ use crate::signer::Signer;
 use crate::util::STRICT_ENCODE_SET;
 use crate::{
     CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, Path, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result, UploadPart,
+    ObjectMeta, ObjectStore, Path, PutMode, PutMultipartMode, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result, UploadPart,
 };
 
 static TAGS_HEADER: HeaderName = HeaderName::from_static("x-amz-tagging");
@@ -112,7 +112,7 @@ impl AmazonS3 {
         from: &Path,
         to: &Path,
         size: u64,
-        mode: CompleteMultipartMode,
+        mode: PutMultipartMode,
     ) -> Result<()> {
         let upload_id = self
             .client
@@ -253,6 +253,11 @@ impl ObjectStore for AmazonS3 {
                             source: Box::new(e),
                         })
                     }
+                    // S3's 409 ConditionalRequestConflict requires retrying the write.
+                    Err(e @ Error::AlreadyExists { .. }) => Err(Error::Generic {
+                        store: STORE,
+                        source: Box::new(e),
+                    }),
                     r => r,
                 }
             }
@@ -299,6 +304,15 @@ impl ObjectStore for AmazonS3 {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let mode = opts.mode;
+        if mode == PutMultipartMode::Create
+            && self.client.config.conditional_put == S3ConditionalPut::Disabled
+        {
+            return Err(Error::NotImplemented {
+                operation: "`put_multipart_opts` with mode `PutMultipartMode::Create` when conditional put is disabled".into(),
+                implementer: self.to_string(),
+            });
+        }
         let upload_id = self.client.create_multipart(location, opts).await?;
 
         Ok(Box::new(S3MultiPartUpload {
@@ -307,6 +321,7 @@ impl ObjectStore for AmazonS3 {
                 client: Arc::clone(&self.client),
                 location: location.clone(),
                 upload_id: upload_id.clone(),
+                mode,
                 parts: Default::default(),
             }),
         }))
@@ -388,7 +403,7 @@ impl ObjectStore for AmazonS3 {
                     .meta;
                 if head_meta.size > self.client.config.multipart_copy_threshold {
                     return self
-                        .copy_multipart(from, to, head_meta.size, CompleteMultipartMode::Overwrite)
+                        .copy_multipart(from, to, head_meta.size, PutMultipartMode::Overwrite)
                         .await;
                 }
                 self.client
@@ -416,13 +431,8 @@ impl ObjectStore for AmazonS3 {
                             )
                             .await?
                             .meta;
-                        self.copy_multipart(
-                            from,
-                            to,
-                            head_meta.size,
-                            CompleteMultipartMode::Create,
-                        )
-                        .await?;
+                        self.copy_multipart(from, to, head_meta.size, PutMultipartMode::Create)
+                            .await?;
                         return Ok(());
                     }
                     None => {
@@ -461,6 +471,7 @@ struct UploadState {
     parts: Parts,
     location: Path,
     upload_id: String,
+    mode: PutMultipartMode,
     client: Arc<S3Client>,
 }
 
@@ -488,15 +499,36 @@ impl MultipartUpload for S3MultiPartUpload {
     async fn complete(&mut self) -> Result<PutResult> {
         let parts = self.state.parts.finish(self.part_idx)?;
 
-        self.state
+        let result = self
+            .state
             .client
             .complete_multipart(
                 &self.state.location,
                 &self.state.upload_id,
                 parts,
-                CompleteMultipartMode::Overwrite,
+                self.state.mode,
             )
-            .await
+            .await;
+        match result {
+            Err(e @ Error::NotModified { .. } | e @ Error::Precondition { .. })
+                if self.state.mode == PutMultipartMode::Create =>
+            {
+                Err(Error::AlreadyExists {
+                    path: self.state.location.to_string(),
+                    source: Box::new(e),
+                })
+            }
+            // Restart after a 409 conflict or a lost completion response (404 NoSuchUpload).
+            Err(e @ Error::AlreadyExists { .. } | e @ Error::NotFound { .. })
+                if self.state.mode == PutMultipartMode::Create =>
+            {
+                Err(Error::Generic {
+                    store: STORE,
+                    source: Box::new(e),
+                })
+            }
+            result => result,
+        }
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -539,7 +571,7 @@ impl MultipartStore for AmazonS3 {
         parts: Vec<PartId>,
     ) -> Result<PutResult> {
         self.client
-            .complete_multipart(path, id, parts, CompleteMultipartMode::Overwrite)
+            .complete_multipart(path, id, parts, PutMultipartMode::Overwrite)
             .await
     }
 

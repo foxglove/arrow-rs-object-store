@@ -30,8 +30,8 @@ use crate::multipart::{MultipartStore, PartId};
 use crate::util::InvalidGetRange;
 use crate::{
     Attributes, GetRange, GetResult, GetResultPayload, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutResult, Result,
-    UpdateVersion, UploadPart, path::Path,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartMode, PutMultipartOptions, PutOptions, PutResult,
+    Result, UpdateVersion, UploadPart, path::Path,
 };
 use crate::{CopyMode, CopyOptions, GetOptions, PutPayload};
 
@@ -226,6 +226,12 @@ impl ObjectStore for InMemory {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        if opts.mode != PutMultipartMode::Overwrite {
+            return Err(crate::Error::NotImplemented {
+                operation: "`put_multipart_opts` with mode `PutMultipartMode::Create`".into(),
+                implementer: self.to_string(),
+            });
+        }
         Ok(Box::new(InMemoryUpload {
             location: location.clone(),
             attributes: opts.attributes,
