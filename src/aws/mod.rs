@@ -499,8 +499,7 @@ impl MultipartUpload for S3MultiPartUpload {
     async fn complete(&mut self) -> Result<PutResult> {
         let parts = self.state.parts.finish(self.part_idx)?;
 
-        let result = self
-            .state
+        self.state
             .client
             .complete_multipart(
                 &self.state.location,
@@ -508,27 +507,7 @@ impl MultipartUpload for S3MultiPartUpload {
                 parts,
                 self.state.mode,
             )
-            .await;
-        match result {
-            Err(e @ Error::NotModified { .. } | e @ Error::Precondition { .. })
-                if self.state.mode == PutMultipartMode::Create =>
-            {
-                Err(Error::AlreadyExists {
-                    path: self.state.location.to_string(),
-                    source: Box::new(e),
-                })
-            }
-            // Restart after a 409 conflict or a lost completion response (404 NoSuchUpload).
-            Err(e @ Error::AlreadyExists { .. } | e @ Error::NotFound { .. })
-                if self.state.mode == PutMultipartMode::Create =>
-            {
-                Err(Error::Generic {
-                    store: STORE,
-                    source: Box::new(e),
-                })
-            }
-            result => result,
-        }
+            .await
     }
 
     async fn abort(&mut self) -> Result<()> {
