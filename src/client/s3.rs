@@ -14,13 +14,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The list and multipart API used by both GCS and S3
+//! The list, multipart and multi-object delete API used by both GCS and S3
 
 use crate::client::list::parse_key;
 use crate::list::{InvalidKey, InvalidKeyHandling};
 use crate::multipart::PartId;
+use crate::path::Path;
 use crate::{ListResult, ObjectMeta, Result};
 use chrono::{DateTime, Utc};
+use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -170,9 +172,129 @@ pub(crate) struct CompleteMultipartUploadResult {
     pub e_tag: String,
 }
 
+/// Builds the XML body of a multi-object delete request for `paths`.
+pub(crate) fn delete_objects_body(paths: &[Path]) -> std::io::Result<Vec<u8>> {
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    writer.write_event(Event::Start(
+        BytesStart::new("Delete")
+            .with_attributes([("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")]),
+    ))?;
+    for path in paths {
+        writer.write_event(Event::Start(BytesStart::new("Object")))?;
+        writer.write_event(Event::Start(BytesStart::new("Key")))?;
+        writer.write_event(Event::Text(BytesText::new(path.as_ref())))?;
+        writer.write_event(Event::End(BytesEnd::new("Key")))?;
+        writer.write_event(Event::End(BytesEnd::new("Object")))?;
+    }
+    writer.write_event(Event::End(BytesEnd::new("Delete")))?;
+    Ok(writer.into_inner())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", rename = "DeleteResult")]
+pub(crate) struct BatchDeleteResponse {
+    #[serde(rename = "$value", default)]
+    content: Vec<DeleteObjectResult>,
+}
+
+#[derive(Deserialize)]
+enum DeleteObjectResult {
+    #[allow(unused)]
+    Deleted(DeletedObject),
+    Error(DeleteError),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", rename = "Deleted")]
+struct DeletedObject {
+    #[allow(dead_code)]
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", rename = "Error")]
+pub(crate) struct DeleteError {
+    pub key: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Error returned when a multi-object delete response names a key that wasn't requested.
+#[derive(Debug, thiserror::Error)]
+#[error("DeleteObjects response contains unexpected key {key}")]
+pub(crate) struct UnexpectedDeleteKey {
+    key: String,
+}
+
+impl BatchDeleteResponse {
+    /// Returns one result per entry in `paths`, in the same order.
+    ///
+    /// Keys absent from the response are treated as deleted, which covers responses to
+    /// requests with `Quiet` set.
+    pub(crate) fn into_results(
+        self,
+        paths: &[Path],
+    ) -> Result<Vec<Result<Path, DeleteError>>, UnexpectedDeleteKey> {
+        let mut results: Vec<Result<Path, DeleteError>> = paths.iter().cloned().map(Ok).collect();
+        for content in self.content {
+            if let DeleteObjectResult::Error(error) = content {
+                let i = paths
+                    .iter()
+                    .position(|p| p.as_ref() == error.key)
+                    .ok_or_else(|| UnexpectedDeleteKey {
+                        key: error.key.clone(),
+                    })?;
+                results[i] = Err(error);
+            }
+        }
+        Ok(results)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_results_follow_input_order() {
+        let paths = [Path::from("a"), Path::from("b"), Path::from("c")];
+        let response: BatchDeleteResponse = quick_xml::de::from_str(
+            "<DeleteResult><Error><Key>c</Key><Code>AccessDenied</Code><Message>no</Message>\
+             </Error><Deleted><Key>a</Key></Deleted></DeleteResult>",
+        )
+        .unwrap();
+
+        let results = response.into_results(&paths).unwrap();
+
+        assert_eq!(results[0].as_ref().unwrap(), &paths[0]);
+        assert_eq!(results[1].as_ref().unwrap(), &paths[1]);
+        assert_eq!(results[2].as_ref().unwrap_err().code, "AccessDenied");
+    }
+
+    #[test]
+    fn quiet_delete_response_has_no_errors() {
+        let paths = [Path::from("a")];
+        let response: BatchDeleteResponse = quick_xml::de::from_str(
+            "<DeleteResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'/>",
+        )
+        .unwrap();
+
+        let results = response.into_results(&paths).unwrap();
+
+        assert_eq!(results[0].as_ref().unwrap(), &paths[0]);
+    }
+
+    #[test]
+    fn delete_response_with_unexpected_key_is_rejected() {
+        let paths = [Path::from("a")];
+        let response: BatchDeleteResponse = quick_xml::de::from_str(
+            "<DeleteResult><Error><Key>z</Key><Code>X</Code><Message>y</Message></Error>\
+             </DeleteResult>",
+        )
+        .unwrap();
+
+        assert!(response.into_results(&paths).is_err());
+    }
 
     /// A page mixing representable keys with ones `Path` cannot represent: an empty
     /// segment, a relative segment, and an ASCII control character. `CommonPrefixes`

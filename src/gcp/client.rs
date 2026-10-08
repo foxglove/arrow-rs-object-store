@@ -21,8 +21,8 @@ use crate::client::header::{HeaderConfig, get_put_result, get_version};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::s3::{
-    CompleteMultipartUpload, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
-    ListResponse, to_list_result,
+    BatchDeleteResponse, CompleteMultipartUpload, CompleteMultipartUploadResult, DeleteError,
+    InitiateMultipartUploadResult, ListResponse, delete_objects_body, to_list_result,
 };
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::gcp::credential::CredentialExt;
@@ -39,11 +39,13 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Buf;
+use futures_util::StreamExt;
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
     CONTENT_TYPE,
 };
 use http::{HeaderName, Method, StatusCode};
+use md5::{Digest, Md5};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -110,6 +112,32 @@ enum Error {
     #[error("Got invalid multipart response: {}", source)]
     InvalidMultipartResponse { source: quick_xml::de::DeError },
 
+    #[error("Error performing DeleteObjects request: {}", source)]
+    DeleteObjectsRequest {
+        source: crate::client::retry::RetryError,
+        paths: Vec<String>,
+    },
+
+    #[error(
+        "DeleteObjects request failed for key {}: {} (code: {})",
+        path,
+        message,
+        code
+    )]
+    DeleteFailed {
+        path: String,
+        code: String,
+        message: String,
+    },
+
+    #[error("Error getting DeleteObjects response body: {}", source)]
+    DeleteObjectsResponse { source: HttpError },
+
+    #[error("Got invalid DeleteObjects response: {}", source)]
+    InvalidDeleteObjectsResponse {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[error("Error signing blob: {}", source)]
     SignBlobRequest {
         source: crate::client::retry::RetryError,
@@ -122,12 +150,23 @@ enum Error {
     InvalidSignBlobSignature { source: base64::DecodeError },
 }
 
+impl From<DeleteError> for Error {
+    fn from(err: DeleteError) -> Self {
+        Self::DeleteFailed {
+            path: err.key,
+            code: err.code,
+            message: err.message,
+        }
+    }
+}
+
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::GetRequest { source, path }
             | Error::Request { source, path }
             | Error::ListRequest { source, path } => source.error(STORE, path),
+            Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -567,6 +606,87 @@ impl GoogleCloudStorageClient {
         Ok(())
     }
 
+    /// Perform a multi-object delete request <https://cloud.google.com/storage/docs/xml-api/post-bucket#delete-multiple>
+    ///
+    /// Returns one result per entry in `paths`, in the same order. Keys that don't exist are
+    /// reported as deleted.
+    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let credential = self.get_credential().await?;
+        let url = format!("{}/{}", self.config.base_url, self.bucket_name_encoded);
+        let body = delete_objects_body(&paths).map_err(|err| crate::Error::Generic {
+            store: STORE,
+            source: Box::new(err),
+        })?;
+
+        // GCS rejects multi-object delete requests without a Content-MD5 or CRC32 checksum.
+        let mut hasher = Md5::new();
+        hasher.update(&body);
+
+        let response = self
+            .client
+            .request(Method::POST, &url)
+            .with_bearer_auth(credential.as_deref())
+            .query(&[("delete", "")])
+            .header(CONTENT_TYPE, "application/xml")
+            .header("Content-MD5", BASE64_STANDARD.encode(hasher.finalize()))
+            .body(body)
+            .retryable(&self.config.retry_config)
+            .idempotent(true)
+            .send()
+            .await;
+
+        let response = match response {
+            // Some GCS-compatible servers, such as emulators, don't implement multi-object delete.
+            Err(source)
+                if matches!(
+                    source.status(),
+                    Some(StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED)
+                ) =>
+            {
+                return Ok(self.delete_each(paths).await);
+            }
+            response => response.map_err(|source| Error::DeleteObjectsRequest {
+                source,
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            })?,
+        };
+
+        let response = response
+            .into_body()
+            .bytes()
+            .await
+            .map_err(|source| Error::DeleteObjectsResponse { source })?;
+
+        let response: BatchDeleteResponse =
+            quick_xml::de::from_reader(response.reader()).map_err(|err| {
+                Error::InvalidDeleteObjectsResponse {
+                    source: Box::new(err),
+                }
+            })?;
+
+        Ok(response
+            .into_results(&paths)
+            .map_err(|err| Error::InvalidDeleteObjectsResponse {
+                source: Box::new(err),
+            })?
+            .into_iter()
+            .map(|result| result.map_err(|error| Error::from(error).into()))
+            .collect())
+    }
+
+    /// Deletes each of `paths` with its own request, up to 10 at a time.
+    async fn delete_each(&self, paths: Vec<Path>) -> Vec<Result<Path>> {
+        futures_util::stream::iter(paths)
+            .map(|path| async move { self.delete_request(&path).await.map(|_| path) })
+            .buffered(10)
+            .collect()
+            .await
+    }
+
     /// Perform a copy request <https://cloud.google.com/storage/docs/xml-api/put-object-copy>
     pub(crate) async fn copy_request(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
         let credential = self.get_credential().await?;
@@ -737,8 +857,116 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryError;
+    use crate::gcp::GoogleCloudStorageBuilder;
+    use crate::{ObjectStore, ObjectStoreExt};
+    use http_body_util::BodyExt;
+    use hyper::Response;
     use reqwest::StatusCode;
+
+    fn mock_store(mock: &MockServer) -> crate::gcp::GoogleCloudStorage {
+        let service_account = format!(
+            r#"{{"gcs_base_url": "{}", "disable_oauth": true, "client_email": "", "private_key": "", "private_key_id": ""}}"#,
+            mock.url()
+        );
+        GoogleCloudStorageBuilder::new()
+            .with_bucket_name("bucket")
+            .with_service_account_key(service_account)
+            .build()
+            .unwrap()
+    }
+
+    async fn delete_all(
+        store: &crate::gcp::GoogleCloudStorage,
+        paths: &[&str],
+    ) -> Vec<Result<Path>> {
+        let paths: Vec<_> = paths.iter().map(|p| Ok(Path::from(*p))).collect();
+        store
+            .delete_stream(futures_util::stream::iter(paths).boxed())
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_sends_one_request_and_maps_errors() {
+        let mock = MockServer::new().await;
+        mock.push_async_fn(|req| async move {
+            assert_eq!(req.method(), Method::POST);
+            assert_eq!(req.uri().path(), "/bucket");
+            assert!(req.uri().query().unwrap().starts_with("delete"));
+            let content_md5 = req.headers()["Content-MD5"].to_str().unwrap().to_owned();
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(content_md5, BASE64_STANDARD.encode(Md5::digest(&body)));
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("<Key>a</Key>"), "{body}");
+            assert!(body.contains("<Key>b &amp; c</Key>"), "{body}");
+            Response::new(
+                "<DeleteResult><Deleted><Key>a</Key></Deleted><Error><Key>b &amp; c</Key>\
+                 <Code>ObjectUnderActiveHold</Code><Message>held</Message></Error>\
+                 <Deleted><Key>missing</Key></Deleted></DeleteResult>"
+                    .to_string(),
+            )
+        });
+
+        let results = delete_all(&mock_store(&mock), &["a", "b & c", "missing"]).await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), &Path::from("a"));
+        let err = results[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("ObjectUnderActiveHold"), "{err}");
+        assert_eq!(results[2].as_ref().unwrap(), &Path::from("missing"));
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_falls_back_to_single_deletes_when_unsupported() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(String::new())
+                .unwrap(),
+        );
+        for _ in 0..2 {
+            mock.push_fn(|req| {
+                assert_eq!(req.method(), Method::DELETE);
+                Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(String::new())
+                    .unwrap()
+            });
+        }
+
+        let results: Vec<Path> = delete_all(&mock_store(&mock), &["a", "b"])
+            .await
+            .into_iter()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        assert_eq!(results, vec![Path::from("a"), Path::from("b")]);
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn single_path_delete_reports_not_found() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), Method::DELETE);
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let err = mock_store(&mock)
+            .delete(&Path::from("missing"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, crate::Error::NotFound { .. }), "{err}");
+        mock.shutdown().await;
+    }
 
     /// A failed list request must be classified by status, not flattened into `Generic`
     #[test]

@@ -29,8 +29,9 @@ use crate::client::header::{get_put_result, get_version};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::s3::{
-    CompleteMultipartUpload, CompleteMultipartUploadResult, CopyPartResult,
-    InitiateMultipartUploadResult, ListResponse, PartMetadata, to_list_result,
+    BatchDeleteResponse, CompleteMultipartUpload, CompleteMultipartUploadResult, CopyPartResult,
+    DeleteError, InitiateMultipartUploadResult, ListResponse, PartMetadata, delete_objects_body,
+    to_list_result,
 };
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
@@ -48,13 +49,11 @@ use http::header::{
     CONTENT_TYPE,
 };
 use http::{HeaderMap, HeaderName, Method};
-use itertools::Itertools;
 use md5::{Digest, Md5};
 use percent_encoding::{PercentEncode, utf8_percent_encode};
-use quick_xml::events::{self as xml_events};
 use ring::digest;
 use ring::digest::Context;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 
 const VERSION_HEADER: &str = "x-amz-version-id";
@@ -155,35 +154,6 @@ impl Default for PutPartPayload<'_> {
 pub(crate) enum CompleteMultipartMode {
     Overwrite,
     Create,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase", rename = "DeleteResult")]
-struct BatchDeleteResponse {
-    #[serde(rename = "$value")]
-    content: Vec<DeleteObjectResult>,
-}
-
-#[derive(Deserialize)]
-enum DeleteObjectResult {
-    #[allow(unused)]
-    Deleted(DeletedObject),
-    Error(DeleteError),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase", rename = "Deleted")]
-struct DeletedObject {
-    #[allow(dead_code)]
-    key: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase", rename = "Error")]
-struct DeleteError {
-    key: String,
-    code: String,
-    message: String,
 }
 
 impl From<DeleteError> for Error {
@@ -507,44 +477,11 @@ impl S3Client {
         let credential = self.config.get_session_credential().await?;
         let url = format!("{}?delete", self.config.bucket_endpoint);
 
-        let mut buffer = Vec::new();
-        let mut writer = quick_xml::Writer::new(&mut buffer);
-        writer
-            .write_event(xml_events::Event::Start(
-                xml_events::BytesStart::new("Delete")
-                    .with_attributes([("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")]),
-            ))
-            .unwrap();
-        for path in &paths {
-            // <Object><Key>{path}</Key></Object>
-            writer
-                .write_event(xml_events::Event::Start(xml_events::BytesStart::new(
-                    "Object",
-                )))
-                .unwrap();
-            writer
-                .write_event(xml_events::Event::Start(xml_events::BytesStart::new("Key")))
-                .unwrap();
-            writer
-                .write_event(xml_events::Event::Text(xml_events::BytesText::new(
-                    path.as_ref(),
-                )))
-                .map_err(|err| crate::Error::Generic {
-                    store: STORE,
-                    source: Box::new(err),
-                })?;
-            writer
-                .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Key")))
-                .unwrap();
-            writer
-                .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Object")))
-                .unwrap();
-        }
-        writer
-            .write_event(xml_events::Event::End(xml_events::BytesEnd::new("Delete")))
-            .unwrap();
-
-        let body = Bytes::from(buffer);
+        let body = delete_objects_body(&paths).map_err(|err| crate::Error::Generic {
+            store: STORE,
+            source: Box::new(err),
+        })?;
+        let body = Bytes::from(body);
 
         let mut builder = self.client.request(Method::POST, url);
         if let Some(headers) = self.config.client_options.get_default_headers() {
@@ -584,19 +521,14 @@ impl S3Client {
                 }
             })?;
 
-        // Assume all were ok, then fill in errors. This guarantees output order
-        // matches input order.
-        let mut results: Vec<Result<Path>> = paths.iter().cloned().map(Ok).collect();
-        for content in response.content.into_iter() {
-            if let DeleteObjectResult::Error(error) = content {
-                let path =
-                    Path::parse(&error.key).map_err(|err| Error::InvalidDeleteObjectsResponse {
-                        source: Box::new(err),
-                    })?;
-                let i = paths.iter().find_position(|&p| p == &path).unwrap().0;
-                results[i] = Err(Error::from(error).into());
-            }
-        }
+        let results = response
+            .into_results(&paths)
+            .map_err(|err| Error::InvalidDeleteObjectsResponse {
+                source: Box::new(err),
+            })?
+            .into_iter()
+            .map(|result| result.map_err(|error| Error::from(error).into()))
+            .collect();
 
         Ok(results)
     }
