@@ -48,7 +48,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use http::Method;
 use url::Url;
 
@@ -187,15 +187,28 @@ impl ObjectStore for GoogleCloudStorage {
     ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
-            .map(move |location| {
+            .try_chunks(1_000)
+            .map(move |locations| {
                 let client = Arc::clone(&client);
                 async move {
-                    let location = location?;
-                    client.delete_request(&location).await?;
-                    Ok(location)
+                    // Early return the error. We ignore the paths that have already been
+                    // collected into the chunk.
+                    let mut locations = locations.map_err(|e| e.1)?;
+                    // A single DELETE reports missing objects as `NotFound`, which the
+                    // multi-object delete API doesn't.
+                    if locations.len() == 1 {
+                        let location = locations.pop().unwrap();
+                        let result = client.delete_request(&location).await.map(|_| location);
+                        return Ok(futures_util::stream::iter(vec![result]));
+                    }
+                    client
+                        .bulk_delete_request(locations)
+                        .await
+                        .map(futures_util::stream::iter)
                 }
             })
-            .buffered(10)
+            .buffered(20)
+            .try_flatten()
             .boxed()
     }
 
