@@ -161,6 +161,32 @@ impl From<DeleteError> for Error {
     }
 }
 
+/// Classifies a per-key multi-object delete error by its code, matching the single-object DELETE
+/// status for that code.
+fn delete_failed_error(err: Error) -> crate::Error {
+    let Error::DeleteFailed { path, code, .. } = &err else {
+        unreachable!("delete_failed_error called with {err:?}");
+    };
+    let path = path.clone();
+    match code.as_str() {
+        // A single-object DELETE returns 403 for these.
+        "AccessDenied" | "ObjectUnderActiveHold" | "RetentionPolicyNotMet" => {
+            crate::Error::PermissionDenied {
+                path,
+                source: Box::new(err),
+            }
+        }
+        "NoSuchKey" => crate::Error::NotFound {
+            path,
+            source: Box::new(err),
+        },
+        _ => crate::Error::Generic {
+            store: STORE,
+            source: Box::new(err),
+        },
+    }
+}
+
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
@@ -168,6 +194,7 @@ impl From<Error> for crate::Error {
             | Error::Request { source, path }
             | Error::ListRequest { source, path } => source.error(STORE, path),
             Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
+            Error::DeleteFailed { .. } => delete_failed_error(err),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -1038,6 +1065,36 @@ mod tests {
         assert!(err.contains("ObjectUnderActiveHold"), "{err}");
         assert_eq!(results[2].as_ref().unwrap(), &Path::from("missing"));
         mock.shutdown().await;
+    }
+
+    #[test]
+    fn delete_failed_codes_map_to_typed_errors() {
+        let classify = |code: &str| {
+            crate::Error::from(Error::DeleteFailed {
+                path: "a".into(),
+                code: code.into(),
+                message: "m".into(),
+            })
+        };
+
+        for code in [
+            "AccessDenied",
+            "ObjectUnderActiveHold",
+            "RetentionPolicyNotMet",
+        ] {
+            assert!(
+                matches!(classify(code), crate::Error::PermissionDenied { ref path, .. } if path == "a"),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            classify("NoSuchKey"),
+            crate::Error::NotFound { ref path, .. } if path == "a"
+        ));
+        assert!(matches!(
+            classify("InternalError"),
+            crate::Error::Generic { .. }
+        ));
     }
 
     #[tokio::test]
