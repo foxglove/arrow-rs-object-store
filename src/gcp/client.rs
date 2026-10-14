@@ -716,7 +716,7 @@ impl GoogleCloudStorageClient {
     /// Perform a multi-object delete request <https://cloud.google.com/storage/docs/xml-api/post-bucket#delete-multiple>
     ///
     /// Returns one result per entry in `paths`, in the same order. Keys that don't exist are
-    /// reported as deleted.
+    /// reported as deleted. If the bucket doesn't exist, every path is reported as `NotFound`.
     pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -755,6 +755,19 @@ impl GoogleCloudStorageClient {
                 ) =>
             {
                 return Ok(self.delete_each(paths).await);
+            }
+            // The request targets the bucket, so a 404 means the bucket doesn't exist.
+            Err(source) if source.status() == Some(StatusCode::NOT_FOUND) => {
+                let source = Arc::new(source);
+                return Ok(paths
+                    .into_iter()
+                    .map(|path| {
+                        Err(crate::Error::NotFound {
+                            path: path.to_string(),
+                            source: Box::new(Arc::clone(&source)),
+                        })
+                    })
+                    .collect());
             }
             response => response.map_err(|source| Error::DeleteObjectsRequest {
                 source,
@@ -1123,6 +1136,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, vec![Path::from("a"), Path::from("b")]);
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_reports_each_path_not_found_when_bucket_is_missing() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), Method::POST);
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let results = delete_all(&mock_store(&mock), &["a", "b"]).await;
+
+        assert_eq!(results.len(), 2);
+        for (result, expected) in results.iter().zip(["a", "b"]) {
+            assert!(
+                matches!(result, Err(crate::Error::NotFound { path, .. }) if path == expected),
+                "{result:?}"
+            );
+        }
         mock.shutdown().await;
     }
 
