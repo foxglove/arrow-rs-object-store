@@ -102,9 +102,10 @@ enum Error {
     #[error("Version required for conditional update")]
     MissingVersion,
 
-    #[error("Error performing complete multipart request: {}", source)]
+    #[error("Error performing complete multipart request {}: {}", path, source)]
     CompleteMultipartRequest {
         source: crate::client::retry::RetryError,
+        path: String,
     },
 
     #[error("Error getting complete multipart response body: {}", source)]
@@ -192,7 +193,8 @@ impl From<Error> for crate::Error {
         match err {
             Error::GetRequest { source, path }
             | Error::Request { source, path }
-            | Error::ListRequest { source, path } => source.error(STORE, path),
+            | Error::ListRequest { source, path }
+            | Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
             Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
             Error::DeleteFailed { .. } => delete_failed_error(err),
             _ => Self::Generic {
@@ -687,7 +689,10 @@ impl GoogleCloudStorageClient {
             .idempotent(true)
             .send()
             .await
-            .map_err(|source| Error::CompleteMultipartRequest { source })?;
+            .map_err(|source| {
+                let path = path.as_ref().into();
+                Error::CompleteMultipartRequest { source, path }
+            })?;
 
         let version = get_version(response.headers(), VERSION_HEADER)
             .map_err(|source| Error::Metadata { source })?;
@@ -980,6 +985,7 @@ mod tests {
     use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryError;
     use crate::gcp::GoogleCloudStorageBuilder;
+    use crate::multipart::MultipartStore;
     use crate::{ObjectStore, ObjectStoreExt};
     use http_body_util::BodyExt;
     use hyper::Response;
@@ -1108,6 +1114,42 @@ mod tests {
             classify("InternalError"),
             crate::Error::Generic { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_classifies_rejections_by_status() {
+        let mock = MockServer::new().await;
+        for status in [StatusCode::FORBIDDEN, StatusCode::PRECONDITION_FAILED] {
+            mock.push_fn(move |req| {
+                assert_eq!(req.method(), Method::POST);
+                assert_eq!(req.uri().query(), Some("uploadId=upload"));
+                Response::builder()
+                    .status(status)
+                    .body(String::new())
+                    .unwrap()
+            });
+        }
+        let store = mock_store(&mock);
+        let path = Path::from("a");
+        let upload_id = "upload".to_string();
+        let complete = || {
+            let parts = vec![PartId {
+                content_id: "etag".into(),
+            }];
+            store.complete_multipart(&path, &upload_id, parts)
+        };
+
+        let forbidden = complete().await.unwrap_err();
+        assert!(
+            matches!(forbidden, crate::Error::PermissionDenied { ref path, .. } if path == "a"),
+            "{forbidden:?}"
+        );
+        let precondition = complete().await.unwrap_err();
+        assert!(
+            matches!(precondition, crate::Error::Precondition { ref path, .. } if path == "a"),
+            "{precondition:?}"
+        );
+        mock.shutdown().await;
     }
 
     #[tokio::test]
