@@ -1098,10 +1098,10 @@ mod tests {
     use crate::list::{InvalidKeyHandling, PaginatedListStore};
     use futures_util::{StreamExt, TryStreamExt};
     use http::Response;
+    use http::StatusCode;
     use http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use hyper::Request;
     use hyper::body::Incoming;
-    use reqwest::StatusCode;
 
     /// A failed list request must be classified by status, not flattened into `Generic`
     #[test]
@@ -1183,6 +1183,7 @@ mod tests {
         mock.shutdown().await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_complete_multipart_create_existing_object() {
         let mock = MockServer::new().await;

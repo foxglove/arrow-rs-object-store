@@ -1872,7 +1872,7 @@ mod tests {
     #[test]
     fn list_request_error_is_typed() {
         use crate::client::retry::RetryError;
-        use reqwest::StatusCode;
+        use http::StatusCode;
 
         let classify = |status| {
             let source = RetryError::from_status(status);

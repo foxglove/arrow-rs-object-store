@@ -991,9 +991,9 @@ mod tests {
     use crate::client::retry::RetryError;
     use crate::gcp::GoogleCloudStorageBuilder;
     use crate::{ObjectStore, ObjectStoreExt};
+    use http::StatusCode;
     use http_body_util::BodyExt;
     use hyper::Response;
-    use reqwest::StatusCode;
 
     fn mock_store(mock: &MockServer) -> crate::gcp::GoogleCloudStorage {
         let service_account = format!(
