@@ -25,15 +25,15 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use http::StatusCode;
+use http::header::ToStrError;
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_RANGE,
     CONTENT_TYPE,
 };
 use http_body_util::BodyExt;
-use reqwest::header::ToStrError;
 use std::ops::Range;
 use std::sync::Arc;
 use tracing::info;
@@ -192,6 +192,7 @@ impl<T: GetClient> GetContext<T> {
             meta,
             range,
             attributes,
+            extensions: parts.extensions,
         })
     }
 
@@ -201,7 +202,7 @@ impl<T: GetClient> GetContext<T> {
         etag: Option<String>,
         range: Range<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
-        futures::stream::try_unfold(
+        futures_util::stream::try_unfold(
             (self, body, etag, range),
             |(mut ctx, mut body, etag, mut range)| async move {
                 while let Some(ret) = body.frame().await {
@@ -244,7 +245,48 @@ impl<T: GetClient> GetContext<T> {
                                 return Err(Self::err(e));
                             }
 
-                            body = retry_body;
+                            // Validate the Content-Range of the retry response
+                            let content_range =
+                                parse_range(&parts.headers).map_err(Self::err)?;
+                            let actual = content_range.range;
+
+                            // Exact match — use body as-is
+                            if actual == range {
+                                body = retry_body;
+                            } else if actual.start <= range.start && actual.end >= range.end
+                            {
+                                // Received range is a superset for requested content,
+                                // skip leading bytes to align to the needed offset.
+                                let skip = (range.start - actual.start) as usize;
+                                let mut skipped = 0;
+                                let mut retry_body = retry_body;
+                                while skipped < skip {
+                                    let frame = retry_body.frame().await
+                                        .ok_or_else(|| Self::err(GetResultError::UnexpectedRange {
+                                            expected: range.clone(), actual: actual.clone(),
+                                        }))?
+                                        .map_err(Self::err)?;
+                                    let Some(bytes) = frame.into_data().ok() else { continue };
+                                    let remaining = skip - skipped;
+                                    if bytes.len() <= remaining {
+                                        skipped += bytes.len();
+                                    } else {
+                                        let keep = bytes.slice(remaining..);
+                                        range.start += keep.len() as u64;
+                                        body = retry_body;
+                                        let etag = Some(etag.clone());
+                                        return Ok(Some((keep, (ctx, body, etag, range))));
+                                    }
+                                }
+                                body = retry_body;
+                            } else {
+                                return Err(Self::err(
+                                    GetResultError::UnexpectedRange {
+                                        expected: range,
+                                        actual,
+                                    },
+                                ));
+                            }
                         }
                         (Err(e), _) => return Err(Self::err(e)),
                     }
@@ -481,7 +523,7 @@ mod tests {
         );
     }
 }
-#[cfg(all(test, feature = "http", not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "http-base", not(target_arch = "wasm32")))]
 mod http_tests {
     use crate::client::mock_server::MockServer;
     use crate::client::{HttpError, HttpErrorKind, HttpResponseBody};
@@ -489,8 +531,8 @@ mod http_tests {
     use crate::path::Path;
     use crate::{ClientOptions, ObjectStoreExt, RetryConfig};
     use bytes::Bytes;
-    use futures::FutureExt;
-    use http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
+    use futures_util::FutureExt;
+    use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
     use http::{Response, StatusCode};
     use hyper::body::Frame;
     use std::pin::Pin;
@@ -548,6 +590,7 @@ mod http_tests {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_stream_retry() {
         let mock = MockServer::new().await;
@@ -578,6 +621,83 @@ mod http_tests {
 
         let b = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(b.as_ref(), b"Hello World");
+
+        // Test basic with range
+        let resp = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_LENGTH, 4)
+            .header(ETAG, "123")
+            .header(CONTENT_RANGE, "bytes 1-4/11")
+            .body("ello".to_string())
+            .unwrap();
+
+        mock.push(resp);
+
+        let b = store.get_range(&path, 1..5).await.unwrap();
+        assert_eq!(b.as_ref(), b"ello");
+
+        // NOTE: if debug_assertions is true, hyper panics with response content length header
+        // value does not match the length of response body.
+        if !cfg!(debug_assertions) {
+            // Test retry if a response body is incomplete.
+            mock.push(
+                Response::builder()
+                    .header(CONTENT_LENGTH, 12)
+                    .header(ETAG, "123")
+                    // connection: close disables keep alive
+                    .header(CONNECTION, "close")
+                    .body("Hello".to_string())
+                    .unwrap(),
+            );
+
+            mock.push_fn(|req| {
+                assert_eq!(
+                    req.headers().get(RANGE).unwrap().to_str().unwrap(),
+                    "bytes=5-11"
+                );
+
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_LENGTH, 7)
+                    .header(ETAG, "123")
+                    .header(CONTENT_RANGE, "bytes 5-11/12")
+                    .body(" World!".to_string())
+                    .unwrap()
+            });
+
+            let ret = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(ret.as_ref(), b"Hello World!");
+
+            // Test retry if a get range response body is incomplete.
+            mock.push(
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_LENGTH, 5)
+                    .header(CONNECTION, "close")
+                    .header(ETAG, "123")
+                    .header(CONTENT_RANGE, "bytes 6-10/12")
+                    .body("Wo".to_string())
+                    .unwrap(),
+            );
+
+            mock.push_fn(|req| {
+                assert_eq!(
+                    req.headers().get(RANGE).unwrap().to_str().unwrap(),
+                    "bytes=8-10"
+                );
+
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_LENGTH, 3)
+                    .header(ETAG, "123")
+                    .header(CONTENT_RANGE, "bytes 8-10/12")
+                    .body("rld".to_string())
+                    .unwrap()
+            });
+
+            let ret = store.get_range(&path, 6..11).await.unwrap();
+            assert_eq!(ret.as_ref(), b"World");
+        }
 
         // Should retry with range
         mock.push(
@@ -693,6 +813,60 @@ mod http_tests {
         assert_eq!(
             err.to_string(),
             "Generic HTTP error: HTTP error: request or response body error"
+        );
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_retry_validate_content_range() {
+        let mock = MockServer::new().await;
+        let retry = RetryConfig {
+            backoff: Default::default(),
+            max_retries: 3,
+            retry_timeout: Duration::from_secs(1000),
+        };
+
+        let options = ClientOptions::new().with_allow_http(true);
+        let store = HttpBuilder::new()
+            .with_client_options(options)
+            .with_retry(retry)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+
+        let path = Path::from("test");
+
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "abc")
+                .body(Chunked::new(vec![
+                    Ok(Bytes::from_static(b"hello")),
+                    Err(()),
+                ]))
+                .unwrap(),
+        );
+
+        mock.push_fn(|req| {
+            assert_eq!(
+                req.headers().get(RANGE).unwrap().to_str().unwrap(),
+                "bytes=5-9"
+            );
+
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "abc")
+                .header(CONTENT_RANGE, "bytes 0-9/10")
+                .body("helloworld".to_string())
+                .unwrap()
+        });
+
+        let result = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            result.as_ref(),
+            b"helloworld",
+            "expected correct 10-byte content"
         );
     }
 }

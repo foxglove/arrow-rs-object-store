@@ -23,13 +23,13 @@ use std::{
 
 use super::Result;
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt, stream::StreamExt};
+use futures_util::{Stream, TryStreamExt, stream::StreamExt};
 
-#[cfg(any(feature = "azure", feature = "http"))]
+#[cfg(any(feature = "azure-base", feature = "http-base"))]
 pub(crate) static RFC1123_FMT: &str = "%a, %d %h %Y %T GMT";
 
 // deserialize dates according to rfc1123
-#[cfg(any(feature = "azure", feature = "http"))]
+#[cfg(any(feature = "azure-base", feature = "http-base"))]
 pub(crate) fn deserialize_rfc1123<'de, D>(
     deserializer: D,
 ) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
@@ -40,12 +40,6 @@ where
     let naive =
         chrono::NaiveDateTime::parse_from_str(&s, RFC1123_FMT).map_err(serde::de::Error::custom)?;
     Ok(chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive))
-}
-
-#[cfg(any(feature = "aws", feature = "azure"))]
-pub(crate) fn hmac_sha256(secret: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> ring::hmac::Tag {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_ref());
-    ring::hmac::sign(&key, bytes.as_ref())
 }
 
 /// Collect a stream into [`Bytes`] avoiding copying in the event of a single chunk
@@ -114,7 +108,7 @@ where
 {
     let fetch_ranges = merge_ranges(ranges, coalesce);
 
-    let fetched: Vec<_> = futures::stream::iter(fetch_ranges.iter().cloned())
+    let fetched: Vec<_> = futures_util::stream::iter(fetch_ranges.iter().cloned())
         .map(fetch)
         .buffered(OBJECT_STORE_COALESCE_PARALLEL)
         .try_collect()
@@ -136,7 +130,7 @@ where
 }
 
 /// Returns a sorted list of ranges that cover `ranges`
-fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+pub(crate) fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     if ranges.is_empty() {
         return vec![];
     }
@@ -300,22 +294,116 @@ impl<T: RangeBounds<u64>> From<T> for GetRange {
 //
 // Do not URI-encode any of the unreserved characters that RFC 3986 defines:
 // A-Z, a-z, 0-9, hyphen ( - ), underscore ( _ ), period ( . ), and tilde ( ~ ).
-#[cfg(any(feature = "aws", feature = "gcp"))]
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
 pub(crate) const STRICT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
 
+/// Append `pairs` to the query string of `url`, percent-encoding keys and values with
+/// [`STRICT_ENCODE_SET`].
+///
+/// [`url::Url::query_pairs_mut`]'s `append_pair` serializes using
+/// `application/x-www-form-urlencoded`, which encodes spaces as `+`. AWS SigV4 and GCS V4 require
+/// spaces as `%20` and sign the canonicalized query string, so the bytes in the URL must match what
+/// is signed. Encoding the pairs ourselves keeps the URL and the signature consistent regardless of
+/// the characters a caller supplies.
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+pub(crate) fn append_strict_query_pairs(url: &mut url::Url, pairs: &[(String, String)]) {
+    use percent_encoding::utf8_percent_encode;
+    use std::fmt::Write;
+
+    if pairs.is_empty() {
+        return;
+    }
+
+    let mut query = url.query().unwrap_or_default().to_owned();
+    for (key, value) in pairs {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        let _ = write!(
+            query,
+            "{}={}",
+            utf8_percent_encode(key, &STRICT_ENCODE_SET),
+            utf8_percent_encode(value, &STRICT_ENCODE_SET),
+        );
+    }
+    url.set_query(Some(&query));
+}
+
+/// Headers that are controlled by the signer (`host`) or silently dropped during canonicalization
+/// (`authorization`, `content-length`, `user-agent`). Allowing a caller to "sign" these would
+/// either corrupt the signature or be a silent no-op, so they are rejected.
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+const RESERVED_SIGNED_HEADERS: [&str; 4] =
+    ["host", "authorization", "content-length", "user-agent"];
+
+/// Validate the `extra_query` and `signed_headers` from a [`SignedUrlOptions`].
+///
+/// Query parameter names that are reserved for the signing protocol (those starting with
+/// `reserved_query_prefix`, e.g. `x-amz-`/`x-goog-`) are rejected so a caller cannot inject a
+/// duplicate `X-Amz-Signature`, `X-Amz-Expires`, etc. Header names in [`RESERVED_SIGNED_HEADERS`]
+/// are likewise rejected.
+///
+/// Header values must be valid UTF-8. While [`http::HeaderValue`] permits
+/// opaque bytes (0x80–0xFF) that UTF-8 does not, the canonical request is built
+/// as a string, so such values cannot be signed.
+///
+/// [`SignedUrlOptions`]: crate::signer::SignedUrlOptions
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+pub(crate) fn validate_signed_url_extras(
+    store: &'static str,
+    extra_query: &[(String, String)],
+    signed_headers: &http::HeaderMap,
+    reserved_query_prefix: &str,
+) -> Result<()> {
+    let err = |source: String| crate::Error::Generic {
+        store,
+        source: source.into(),
+    };
+
+    for (name, _) in extra_query {
+        if name.is_empty() {
+            return Err(err("query parameter name must not be empty".to_string()));
+        }
+        if name.to_ascii_lowercase().starts_with(reserved_query_prefix) {
+            return Err(err(format!(
+                "query parameter {name:?} is reserved for request signing and cannot be set via SignedUrlOptions"
+            )));
+        }
+    }
+
+    for (name, value) in signed_headers {
+        if RESERVED_SIGNED_HEADERS.contains(&name.as_str()) {
+            return Err(err(format!(
+                "header {name:?} is controlled by the signer and cannot be signed via SignedUrlOptions"
+            )));
+        }
+        if std::str::from_utf8(value.as_bytes()).is_err() {
+            return Err(err(format!(
+                "value of header {name:?} is not valid UTF-8 and cannot be signed via SignedUrlOptions"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Computes the SHA256 digest of `body` returned as a hex encoded string
-#[cfg(any(feature = "aws", feature = "gcp"))]
-pub(crate) fn hex_digest(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    hex_encode(digest.as_ref())
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+pub(crate) fn hex_digest(
+    crypto: &dyn crate::client::CryptoProvider,
+    bytes: &[u8],
+) -> Result<String> {
+    let mut ctx = crypto.digest(crate::client::DigestAlgorithm::Sha256)?;
+    ctx.update(bytes);
+    Ok(hex_encode(ctx.finish()?))
 }
 
 /// Returns `bytes` as a lower-case hex encoded string
-#[cfg(any(feature = "aws", feature = "gcp"))]
+#[cfg(any(feature = "aws-base", feature = "gcp-base"))]
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -331,7 +419,7 @@ mod tests {
     use crate::Error;
 
     use super::*;
-    use rand::{Rng, rng};
+    use rand::{RngExt, rng};
     use std::ops::Range;
 
     /// Calls coalesce_ranges and validates the returned data is correct
@@ -348,7 +436,7 @@ mod tests {
                 fetches.push(range.clone());
                 let start = usize::try_from(range.start).unwrap();
                 let end = usize::try_from(range.end).unwrap();
-                futures::future::ready(Ok(Bytes::from(src[start..end].to_vec())))
+                futures_util::future::ready(Ok(Bytes::from(src[start..end].to_vec())))
             },
             coalesce,
         )
@@ -487,5 +575,111 @@ mod tests {
 
         let range = GetRange::Offset(1);
         assert_eq!(range.as_range(2).unwrap(), 1..2);
+    }
+
+    #[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+    fn owned_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+    #[test]
+    fn append_strict_query_pairs_uses_percent_encoding() {
+        let mut url = url::Url::parse("https://example.com/object").unwrap();
+        append_strict_query_pairs(
+            &mut url,
+            &owned_pairs(&[("a key", "a value"), ("plus", "a+b/c=d")]),
+        );
+        // Spaces are `%20` (not `+`), and reserved characters are percent-encoded.
+        assert_eq!(url.query().unwrap(), "a%20key=a%20value&plus=a%2Bb%2Fc%3Dd");
+        // Appending to an existing query preserves it.
+        append_strict_query_pairs(&mut url, &owned_pairs(&[("x", "y")]));
+        assert!(url.query().unwrap().ends_with("&x=y"));
+        // Empty input is a no-op.
+        let before = url.query().unwrap().to_owned();
+        append_strict_query_pairs(&mut url, &[]);
+        assert_eq!(url.query().unwrap(), before);
+    }
+
+    #[cfg(any(feature = "aws-base", feature = "gcp-base"))]
+    #[test]
+    fn validate_signed_url_extras_accepts_and_rejects() {
+        use http::{HeaderMap, HeaderName, HeaderValue};
+
+        let header = |name: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(HeaderName::from_static(name), HeaderValue::from_static("v"));
+            h
+        };
+
+        // Legitimate extras are accepted.
+        validate_signed_url_extras(
+            "S3",
+            &owned_pairs(&[("partNumber", "1"), ("uploadId", "abc")]),
+            &header("content-type"),
+            "x-amz-",
+        )
+        .unwrap();
+
+        // Reserved query parameters are rejected (case-insensitively).
+        for key in ["X-Amz-Signature", "x-amz-expires", "X-Amz-Security-Token"] {
+            let err = validate_signed_url_extras(
+                "S3",
+                &owned_pairs(&[(key, "x")]),
+                &HeaderMap::new(),
+                "x-amz-",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::Generic { .. }),
+                "{key} should be rejected"
+            );
+        }
+        // GCS uses a different reserved prefix.
+        assert!(
+            validate_signed_url_extras(
+                "GCS",
+                &owned_pairs(&[("X-Goog-Signature", "x")]),
+                &HeaderMap::new(),
+                "x-goog-"
+            )
+            .is_err()
+        );
+
+        // Empty query parameter names are rejected.
+        assert!(
+            validate_signed_url_extras(
+                "S3",
+                &owned_pairs(&[("", "x")]),
+                &HeaderMap::new(),
+                "x-amz-"
+            )
+            .is_err()
+        );
+
+        // Headers controlled by the signer or dropped during canonicalization are rejected.
+        for name in ["host", "authorization", "content-length", "user-agent"] {
+            let err = validate_signed_url_extras("S3", &[], &header(name), "x-amz-").unwrap_err();
+            assert!(
+                matches!(err, Error::Generic { .. }),
+                "{name} should be rejected"
+            );
+        }
+
+        // Header values that are not valid UTF-8 (which `HeaderValue` permits) are rejected
+        // with an error rather than panicking during canonicalization.
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_bytes(&[0xFF]).unwrap(),
+        );
+        let err = validate_signed_url_extras("S3", &[], &non_utf8, "x-amz-").unwrap_err();
+        assert!(
+            matches!(err, Error::Generic { .. }),
+            "non-UTF-8 header value should be rejected"
+        );
     }
 }

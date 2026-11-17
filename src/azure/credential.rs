@@ -21,8 +21,10 @@ use crate::azure::STORE;
 use crate::client::builder::{HttpRequestBuilder, add_query_pairs};
 use crate::client::retry::RetryExt;
 use crate::client::token::{TemporaryToken, TokenCache};
-use crate::client::{CredentialProvider, HttpClient, HttpError, HttpRequest, TokenProvider};
-use crate::util::hmac_sha256;
+use crate::client::{
+    CredentialProvider, CryptoProvider, DigestAlgorithm, HttpClient, HttpError, HttpRequest,
+    TokenProvider, crypto_provider,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
@@ -45,9 +47,8 @@ use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 static AZURE_VERSION: HeaderValue = HeaderValue::from_static("2023-11-03");
-static VERSION: HeaderName = HeaderName::from_static("x-ms-version");
+pub(crate) static VERSION: HeaderName = HeaderName::from_static("x-ms-version");
 pub(crate) static BLOB_TYPE: HeaderName = HeaderName::from_static("x-ms-blob-type");
-pub(crate) static DELETE_SNAPSHOTS: HeaderName = HeaderName::from_static("x-ms-delete-snapshots");
 pub(crate) static COPY_SOURCE: HeaderName = HeaderName::from_static("x-ms-copy-source");
 static CONTENT_MD5: HeaderName = HeaderName::from_static("content-md5");
 static PARTNER_TOKEN: HeaderName = HeaderName::from_static("x-ms-partner-token");
@@ -188,7 +189,12 @@ impl AzureSigner {
         }
     }
 
-    pub(crate) fn sign(&self, method: &Method, url: &mut Url) -> Result<()> {
+    pub(crate) fn sign(
+        &self,
+        crypto: &dyn CryptoProvider,
+        method: &Method,
+        url: &mut Url,
+    ) -> crate::Result<()> {
         let (str_to_sign, query_pairs) = match &self.delegation_key {
             Some(delegation_key) => string_to_sign_user_delegation_sas(
                 url,
@@ -200,7 +206,10 @@ impl AzureSigner {
             ),
             None => string_to_sign_service_sas(url, method, &self.account, &self.start, &self.end),
         };
-        let auth = hmac_sha256(&self.signing_key.0, str_to_sign);
+        let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, &self.signing_key.0)?;
+        ctx.update(str_to_sign.as_bytes());
+        let auth = ctx.finish()?;
+
         url.query_pairs_mut().extend_pairs(query_pairs);
         url.query_pairs_mut()
             .append_pair("sig", BASE64_STANDARD.encode(auth).as_str());
@@ -215,15 +224,20 @@ fn add_date_and_version_headers(request: &mut HttpRequest) {
     // we formatted the data string ourselves, so unwrapping should be fine
     let date_val = HeaderValue::from_str(&date_str).unwrap();
     request.headers_mut().insert(DATE, date_val);
-    request
-        .headers_mut()
-        .insert(&VERSION, AZURE_VERSION.clone());
+    // Preserve an explicit per-request override when a call site needs a newer
+    // service version than the backend default.
+    if !request.headers().contains_key(&VERSION) {
+        request
+            .headers_mut()
+            .insert(&VERSION, AZURE_VERSION.clone());
+    }
 }
 
 /// Authorize a [`HttpRequest`] with an [`AzureAuthorizer`]
 #[derive(Debug)]
 pub struct AzureAuthorizer<'a> {
     credential: &'a AzureCredential,
+    crypto: Option<&'a dyn CryptoProvider>,
     account: &'a str,
 }
 
@@ -233,23 +247,46 @@ impl<'a> AzureAuthorizer<'a> {
         AzureAuthorizer {
             credential,
             account,
+            crypto: None,
         }
     }
 
+    /// Specify the crypto provider
+    pub fn with_crypto(mut self, crypto: &'a dyn CryptoProvider) -> Self {
+        self.crypto = Some(crypto);
+        self
+    }
+
+    fn crypto(&self) -> crate::Result<&dyn CryptoProvider> {
+        crypto_provider(self.crypto)
+    }
+
     /// Authorize `request`
+    ///
+    /// # Panics
+    ///
+    /// Panics on cryptography error
+    #[deprecated(note = "use AzureAuthorizer::try_authorize")]
     pub fn authorize(&self, request: &mut HttpRequest) {
+        self.try_authorize(request).unwrap()
+    }
+
+    /// Authorize `request`
+    pub fn try_authorize(&self, request: &mut HttpRequest) -> crate::Result<()> {
         add_date_and_version_headers(request);
 
         match self.credential {
             AzureCredential::AccessKey(key) => {
+                let crypto = self.crypto()?;
                 let url = Url::parse(&request.uri().to_string()).unwrap();
                 let signature = generate_authorization(
+                    crypto,
                     request.headers(),
                     &url,
                     request.method(),
                     self.account,
                     key,
-                );
+                )?;
 
                 // "signature" is a base 64 encoded string so it should never
                 // contain illegal characters
@@ -268,53 +305,67 @@ impl<'a> AzureAuthorizer<'a> {
                 add_query_pairs(request.uri_mut(), query_pairs);
             }
         }
+        Ok(())
     }
 }
 
-pub(crate) trait CredentialExt {
+pub(crate) trait CredentialExt: Sized {
     /// Apply authorization to requests against azure storage accounts
     /// <https://docs.microsoft.com/en-us/rest/api/storageservices/authorize-requests-to-azure-storage>
     fn with_azure_authorization(
         self,
+        crypto: Option<&dyn CryptoProvider>,
         credential: &Option<impl Deref<Target = AzureCredential>>,
         account: &str,
-    ) -> Self;
+    ) -> crate::Result<Self>;
 }
 
 impl CredentialExt for HttpRequestBuilder {
     fn with_azure_authorization(
         self,
+        crypto: Option<&dyn CryptoProvider>,
         credential: &Option<impl Deref<Target = AzureCredential>>,
         account: &str,
-    ) -> Self {
+    ) -> crate::Result<Self> {
         let (client, request) = self.into_parts();
         let mut request = request.expect("request valid");
 
         match credential.as_deref() {
             Some(credential) => {
-                AzureAuthorizer::new(credential, account).authorize(&mut request);
+                let mut authorizer = AzureAuthorizer::new(credential, account);
+                if let Some(crypto) = crypto {
+                    authorizer = authorizer.with_crypto(crypto);
+                }
+                authorizer.try_authorize(&mut request)?;
             }
             None => {
                 add_date_and_version_headers(&mut request);
             }
         }
 
-        Self::from_parts(client, request)
+        Ok(Self::from_parts(client, request))
     }
 }
 
 /// Generate signed key for authorization via access keys
 /// <https://docs.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key>
 fn generate_authorization(
+    crypto: &dyn CryptoProvider,
     h: &HeaderMap,
     u: &Url,
     method: &Method,
     account: &str,
     key: &AzureAccessKey,
-) -> String {
+) -> crate::Result<String> {
     let str_to_sign = string_to_sign(h, u, method, account);
-    let auth = hmac_sha256(&key.0, str_to_sign);
-    format!("SharedKey {}:{}", account, BASE64_STANDARD.encode(auth))
+    let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, &key.0)?;
+    ctx.update(str_to_sign.as_bytes());
+    let auth = ctx.finish()?;
+    Ok(format!(
+        "SharedKey {}:{}",
+        account,
+        BASE64_STANDARD.encode(auth)
+    ))
 }
 
 fn add_if_exists<'a>(h: &'a HeaderMap, key: &HeaderName) -> &'a str {
@@ -390,18 +441,18 @@ fn string_to_sign_service_sas(
         signed_start,
         signed_expiry,
         canonicalized_resource,
-        "",                               // signed identifier
-        "",                               // signed ip
-        "",                               // signed protocol
-        &AZURE_VERSION.to_str().unwrap(), // signed version
-        signed_resource,                  // signed resource
-        "",                               // signed snapshot time
-        "",                               // signed encryption scope
-        "",                               // rscc - response header: Cache-Control
-        "",                               // rscd - response header: Content-Disposition
-        "",                               // rsce - response header: Content-Encoding
-        "",                               // rscl - response header: Content-Language
-        "",                               // rsct - response header: Content-Type
+        "",                              // signed identifier
+        "",                              // signed ip
+        "",                              // signed protocol
+        AZURE_VERSION.to_str().unwrap(), // signed version
+        signed_resource,                 // signed resource
+        "",                              // signed snapshot time
+        "",                              // signed encryption scope
+        "",                              // rscc - response header: Cache-Control
+        "",                              // rscd - response header: Content-Disposition
+        "",                              // rsce - response header: Content-Encoding
+        "",                              // rscl - response header: Content-Language
+        "",                              // rsct - response header: Content-Type
     );
 
     let mut pairs = HashMap::new();
@@ -434,26 +485,26 @@ fn string_to_sign_user_delegation_sas(
         signed_start,
         signed_expiry,
         canonicalized_resource,
-        delegation_key.signed_oid,        // signed key object id
-        delegation_key.signed_tid,        // signed key tenant id
-        delegation_key.signed_start,      // signed key start
-        delegation_key.signed_expiry,     // signed key expiry
-        delegation_key.signed_service,    // signed key service
-        delegation_key.signed_version,    // signed key version
-        "",                               // signed authorized user object id
-        "",                               // signed unauthorized user object id
-        "",                               // signed correlation id
-        "",                               // signed ip
-        "",                               // signed protocol
-        &AZURE_VERSION.to_str().unwrap(), // signed version
-        signed_resource,                  // signed resource
-        "",                               // signed snapshot time
-        "",                               // signed encryption scope
-        "",                               // rscc - response header: Cache-Control
-        "",                               // rscd - response header: Content-Disposition
-        "",                               // rsce - response header: Content-Encoding
-        "",                               // rscl - response header: Content-Language
-        "",                               // rsct - response header: Content-Type
+        delegation_key.signed_oid,       // signed key object id
+        delegation_key.signed_tid,       // signed key tenant id
+        delegation_key.signed_start,     // signed key start
+        delegation_key.signed_expiry,    // signed key expiry
+        delegation_key.signed_service,   // signed key service
+        delegation_key.signed_version,   // signed key version
+        "",                              // signed authorized user object id
+        "",                              // signed unauthorized user object id
+        "",                              // signed correlation id
+        "",                              // signed ip
+        "",                              // signed protocol
+        AZURE_VERSION.to_str().unwrap(), // signed version
+        signed_resource,                 // signed resource
+        "",                              // signed snapshot time
+        "",                              // signed encryption scope
+        "",                              // rscc - response header: Cache-Control
+        "",                              // rscd - response header: Content-Disposition
+        "",                              // rsce - response header: Content-Encoding
+        "",                              // rscl - response header: Content-Language
+        "",                              // rsct - response header: Content-Type
     );
 
     let mut pairs = HashMap::new();
@@ -1017,7 +1068,7 @@ impl TokenProvider for FabricTokenOAuthProvider {
     ) -> crate::Result<TemporaryToken<Arc<AzureCredential>>> {
         if let Some(storage_access_token) = &self.storage_access_token {
             if let Some(expiry) = self.token_expiry {
-                let exp_in = expiry - Self::get_current_timestamp();
+                let exp_in = expiry.saturating_sub(Self::get_current_timestamp());
                 if exp_in > TOKEN_MIN_TTL {
                     return Ok(TemporaryToken {
                         token: Arc::new(AzureCredential::BearerToken(storage_access_token.clone())),
@@ -1044,8 +1095,9 @@ impl TokenProvider for FabricTokenOAuthProvider {
             .text()
             .await
             .map_err(|source| Error::TokenResponseBody { source })?;
-        let exp_in = Self::validate_and_get_expiry(&access_token)
-            .map_or(3600, |expiry| expiry - Self::get_current_timestamp());
+        let exp_in = Self::validate_and_get_expiry(&access_token).map_or(3600, |expiry| {
+            expiry.saturating_sub(Self::get_current_timestamp())
+        });
         Ok(TemporaryToken {
             token: Arc::new(AzureCredential::BearerToken(access_token)),
             expiry: Some(Instant::now() + Duration::from_secs(exp_in)),
@@ -1064,7 +1116,7 @@ impl CredentialProvider for AzureCliCredential {
 
 #[cfg(test)]
 mod tests {
-    use futures::executor::block_on;
+    use futures_executor::block_on;
     use http::{Response, StatusCode};
     use http_body_util::BodyExt;
     use reqwest::{Client, Method};
@@ -1072,9 +1124,12 @@ mod tests {
 
     use super::*;
     use crate::azure::MicrosoftAzureBuilder;
+    use crate::azure::client::RequestVersionExt;
+    use crate::client::HttpRequestBody;
     use crate::client::mock_server::MockServer;
     use crate::{ObjectStoreExt, Path};
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_managed_identity() {
         let server = MockServer::new().await;
@@ -1133,6 +1188,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_workload_identity() {
         let server = MockServer::new().await;
@@ -1185,6 +1241,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_no_credentials() {
         let server = MockServer::new().await;
@@ -1216,5 +1273,125 @@ mod tests {
                 panic!("unexpected response");
             }
         }
+    }
+
+    #[test]
+    fn bearer_authorization_does_not_require_crypto_provider() {
+        let credential = Some(Arc::new(AzureCredential::BearerToken("TOKEN".into())));
+        let builder = HttpRequestBuilder::new(HttpClient::new(Client::new()))
+            .method(Method::GET)
+            .uri("https://account.blob.core.windows.net/container/file.txt")
+            .body(HttpRequestBody::empty())
+            .with_azure_authorization(None, &credential, "account")
+            .unwrap();
+
+        let (_, request) = builder.into_parts();
+        let request = request.unwrap();
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer TOKEN"
+        );
+        assert!(request.headers().contains_key(&DATE));
+        assert!(request.headers().contains_key(&VERSION));
+    }
+
+    #[test]
+    fn sas_authorization_does_not_require_crypto_provider() {
+        let credential = Some(Arc::new(AzureCredential::SASToken(vec![
+            ("sig".into(), "signature".into()),
+            ("se".into(), "expiry".into()),
+        ])));
+        let builder = HttpRequestBuilder::new(HttpClient::new(Client::new()))
+            .method(Method::GET)
+            .uri("https://account.blob.core.windows.net/container/file.txt")
+            .body(HttpRequestBody::empty())
+            .with_azure_authorization(None, &credential, "account")
+            .unwrap();
+
+        let (_, request) = builder.into_parts();
+        let request = request.unwrap();
+        let query = request.uri().query().unwrap();
+        assert!(query.contains("sig=signature"));
+        assert!(query.contains("se=expiry"));
+        assert!(request.headers().contains_key(&DATE));
+        assert!(request.headers().contains_key(&VERSION));
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_fabric_refresh_expired_token() {
+        let server = MockServer::new().await;
+
+        // Create an expired initial token (1 hour in the past)
+        let expired_timestamp = FabricTokenOAuthProvider::get_current_timestamp() - 3600;
+        let claims = format!(r#"{{"exp":{expired_timestamp}}}"#);
+        let encoded_claims = BASE64_URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let expired_token = format!("header.{encoded_claims}.signature");
+
+        // Create a fresh token that the mock API will return (1 hour in the future)
+        let fresh_timestamp = FabricTokenOAuthProvider::get_current_timestamp() + 3600;
+        let fresh_claims = format!(r#"{{"exp":{fresh_timestamp}}}"#);
+        let fresh_encoded = BASE64_URL_SAFE_NO_PAD.encode(fresh_claims.as_bytes());
+        let fresh_token = format!("header.{fresh_encoded}.signature");
+        let expected_token = fresh_token.clone();
+
+        // Mock the Fabric token service to return a fresh token
+        server.push_fn(move |req| {
+            assert_eq!(req.headers().get(&PARTNER_TOKEN).unwrap(), "session-token");
+            assert_eq!(
+                req.headers().get(&CLUSTER_IDENTIFIER).unwrap(),
+                "cluster-id"
+            );
+            assert_eq!(req.headers().get(&PROXY_HOST).unwrap(), "fake");
+
+            Response::new(fresh_token)
+        });
+
+        let provider = FabricTokenOAuthProvider {
+            fabric_token_service_url: server.url().to_string(),
+            fabric_workload_host: "fake".to_string(),
+            fabric_session_token: "session-token".to_string(),
+            fabric_cluster_identifier: "cluster-id".to_string(),
+            storage_access_token: Some(expired_token),
+            token_expiry: Some(expired_timestamp),
+        };
+
+        let client = HttpClient::new(Client::new());
+        let retry = RetryConfig::default();
+
+        let result = provider.fetch_token(&client, &retry).await;
+
+        assert!(
+            result.is_ok(),
+            "fetch_token should handle expired cached token gracefully"
+        );
+
+        let temp_token = result.unwrap();
+
+        // Verify we got a fresh token from the API (not the expired cached one)
+        if let AzureCredential::BearerToken(token) = temp_token.token.as_ref() {
+            assert_eq!(
+                token, &expected_token,
+                "Should have fetched fresh token from API, not returned expired cached token"
+            );
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn test_azure_authorization_preserves_explicit_version() {
+        let credential = Some(Arc::new(AzureCredential::BearerToken("token".to_string())));
+        let client = HttpClient::new(Client::new());
+
+        let request = client
+            .request(Method::GET, "http://example.com/container/blob")
+            .with_azure_version("2026-02-06")
+            .with_azure_authorization(None, &credential, "account")
+            .unwrap()
+            .into_parts()
+            .1
+            .unwrap();
+
+        assert_eq!(request.headers().get(&VERSION).unwrap(), "2026-02-06");
     }
 }

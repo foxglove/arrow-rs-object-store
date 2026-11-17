@@ -50,6 +50,20 @@ It's possible to build `object_store` for the `wasm32-unknown-unknown` target, h
 cargo build -p object_store --target wasm32-unknown-unknown
 ```
 
+## Disabling `reqwest`
+
+The `aws`, `azure`, `gcp`, and `http` features each bundle a [`reqwest`]-based HTTP transport. To target [`wasm32-wasip1`] (where `reqwest` does not compile) or otherwise supply your own HTTP client, build against the matching `*-base` feature instead:
+
+```
+cargo build -p object_store --no-default-features --features aws-base --target wasm32-wasip1
+```
+
+See [Disabling `reqwest`] in the crate docs for full details.
+
+[`reqwest`]: https://crates.io/crates/reqwest
+[`wasm32-wasip1`]: https://doc.rust-lang.org/rustc/platform-support/wasm32-wasip1.html
+[Disabling `reqwest`]: https://docs.rs/object_store/latest/object_store/#disabling-reqwest
+
 ## Related Apache Crates
 
 Here are several related crates in different repositories from other Apache projects.
@@ -85,8 +99,8 @@ There following community maintained crates provide additional functionality for
 The [`object_store`] crate follows [Semantic Versioning]. We aim to release new
 versions approximately every 2 months.
 
-Please see [the release tracker] for an up to date release schedule and to track
-the progress of upcoming releases.
+Please see [the release tracker] for an up to date release schedule, to track
+the progress of upcoming releases, and request features or fixes. 
 
 [`object_store`]: https://crates.io/crates/object_store
 [semantic versioning]: https://semver.org/
@@ -96,7 +110,6 @@ Planned Release Schedule
 
 | Approximate Date | Version  | Notes                          | Ticket                                                             |
 |------------------|----------|--------------------------------|:-------------------------------------------------------------------|
-| July 2025        | `0.12.3` | Minor, NO breaking API changes | [#428](https://github.com/apache/arrow-rs-object-store/issues/428) |
-| Sep 2025         | `0.12.4` | Minor, NO breaking API changes | [#498](https://github.com/apache/arrow-rs-object-store/issues/489) |
-| Nov 2025         | `0.13.0` | Major, breaking API changes    | [#367](https://github.com/apache/arrow-rs-object-store/issues/367) |
-| TBD              | `0.13.1` | Minor, NO breaking API changes | [#393](https://github.com/apache/arrow-rs-object-store/issues/393) |
+| Sep 2026         | `0.14.2` | Minor, NO breaking API changes | [#832](https://github.com/apache/arrow-rs-object-store/issues/832) |
+| Oct 2026         | `0.14.3` | Minor, NO breaking API changes | [#833](https://github.com/apache/arrow-rs-object-store/issues/833) |
+| TBD              | `0.15.0` | Major, breaking API changes    | [#762](https://github.com/apache/arrow-rs-object-store/issues/762) |

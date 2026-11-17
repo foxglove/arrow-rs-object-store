@@ -21,10 +21,10 @@ use crate::PutPayload;
 use crate::client::backoff::{Backoff, BackoffConfig};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::{HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse};
-use futures::future::BoxFuture;
+use futures_util::future::BoxFuture;
+use http::StatusCode;
+use http::header::LOCATION;
 use http::{Method, Uri};
-use reqwest::StatusCode;
-use reqwest::header::LOCATION;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -122,7 +122,10 @@ pub enum RequestError {
     #[error("Server returned error response: {body}")]
     Response { status: StatusCode, body: String },
 
-    #[error(transparent)]
+    // We need to use `{0}` here rather than `error(transparent)` to ensure that
+    // `Error::source` returns `HttpError` rather than the underlying
+    // `reqwest::Error` which would happen with `error(transparent)`.
+    #[error("{0}")]
     Http(#[from] HttpError),
 }
 
@@ -149,6 +152,23 @@ impl RetryError {
             RequestError::Response { body, .. } => Some(body),
             RequestError::BareRedirect | RequestError::Http(_) => None,
         }
+    }
+
+    /// Constructs a [`RetryError`] for a request that failed with `status`
+    #[cfg(all(
+        test,
+        any(feature = "aws-base", feature = "gcp-base", feature = "azure-base")
+    ))]
+    pub(crate) fn from_status(status: StatusCode) -> Self {
+        Self(Box::new(RetryErrorImpl {
+            method: Method::GET,
+            uri: None,
+            retries: 0,
+            max_retries: 0,
+            elapsed: Duration::from_secs(0),
+            retry_timeout: Duration::from_secs(0),
+            inner: RequestError::Status { status, body: None },
+        }))
     }
 
     pub fn error(self, store: &'static str, path: String) -> crate::Error {
@@ -277,7 +297,7 @@ impl RetryableRequestBuilder {
     }
 
     /// Set whether this request should be retried on a 409 Conflict response.
-    #[cfg(feature = "aws")]
+    #[cfg(feature = "aws-base")]
     pub(crate) fn retry_on_conflict(mut self, retry_on_conflict: bool) -> Self {
         self.request.retry_on_conflict = retry_on_conflict;
         self
@@ -407,15 +427,12 @@ impl RetryableRequest {
                                 || status == StatusCode::REQUEST_TIMEOUT
                                 || (self.retry_on_conflict && status == StatusCode::CONFLICT))
                         {
-                            let source = match status.is_client_error() {
-                                true => match r.into_body().text().await {
-                                    Ok(body) => RequestError::Status {
-                                        status,
-                                        body: Some(body),
-                                    },
-                                    Err(e) => RequestError::Http(e),
+                            let source = match r.into_body().text().await {
+                                Ok(body) => RequestError::Status {
+                                    status,
+                                    body: Some(body),
                                 },
-                                false => RequestError::Status { status, body: None },
+                                Err(e) => RequestError::Http(e),
                             };
                             return Err(self.err(source, ctx));
                         };
@@ -511,14 +528,16 @@ mod tests {
     use crate::RetryConfig;
     use crate::client::mock_server::MockServer;
     use crate::client::retry::{RequestError, RetryContext, RetryExt, body_contains_error};
-    use crate::client::{HttpClient, HttpResponse};
+    use crate::client::{HttpClient, HttpError, HttpErrorKind, HttpResponse};
+    use http::Method;
     use http::StatusCode;
     use hyper::Response;
     use hyper::header::LOCATION;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use reqwest::{Client, Method};
+    #[cfg(feature = "reqwest")]
+    use reqwest::Client;
     use std::convert::Infallible;
     use std::error::Error;
     use std::time::Duration;
@@ -539,6 +558,7 @@ mod tests {
         assert!(!body_contains_error(success_response));
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_retry() {
         let mock = MockServer::new().await;
@@ -703,14 +723,16 @@ mod tests {
 
         let e = do_request().await.unwrap_err();
         assert!(
-            e.to_string().contains(" after 2 retries, max_retries: 2, retry_timeout: 1000s  - Server returned non-2xx status code: 502 Bad Gateway"),
+            e.to_string().contains(" after 2 retries, max_retries: 2, retry_timeout: 1000s  - Server returned non-2xx status code: 502 Bad Gateway: ignored"),
             "{e}"
         );
         // verify e.source() is available as well for users who need programmatic access
         assert_eq!(
             e.source().unwrap().to_string(),
-            "Server returned non-2xx status code: 502 Bad Gateway: ",
+            "Server returned non-2xx status code: 502 Bad Gateway: ignored",
         );
+        // verify body is accessible
+        assert_eq!(e.body(), Some("ignored"));
 
         // Panic results in an incomplete message error in the client
         mock.push_fn::<_, String>(|_| panic!());
@@ -731,6 +753,18 @@ mod tests {
             e.source().unwrap().to_string(),
             "HTTP error: error sending request",
         );
+        // the HttpError type needs to be directly accessible in the source chain
+        let mut err: &dyn Error = &e;
+        let mut found = false;
+        while let Some(source) = err.source() {
+            err = source;
+            if let Some(http_err) = err.downcast_ref::<HttpError>() {
+                assert_eq!(http_err.kind(), HttpErrorKind::Request);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "HttpError not found in source chain");
 
         // Retries on client timeout
         mock.push_async_fn(|_| async move {
@@ -832,7 +866,47 @@ mod tests {
         mock.shutdown().await
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
+    async fn test_503_error_body_captured() {
+        let mock = MockServer::new().await;
+
+        let retry = RetryConfig {
+            backoff: Default::default(),
+            max_retries: 0,
+            retry_timeout: Duration::from_secs(1000),
+        };
+
+        let client = HttpClient::new(Client::builder().build().unwrap());
+
+        // Test that 503 SlowDown body is captured for throttling detection
+        let slowdown_body = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>"#;
+        mock.push(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(slowdown_body.to_string())
+                .unwrap(),
+        );
+
+        let e = client
+            .request(Method::GET, mock.url())
+            .send_retry(&retry)
+            .await
+            .unwrap_err();
+
+        assert_eq!(e.status().unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.body(), Some(slowdown_body));
+        assert!(e.body().unwrap().contains("SlowDown"));
+
+        mock.shutdown().await
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "SO_LINGER w/ zero timeout doesn't block, see https://github.com/tokio-rs/tokio/issues/7751#issuecomment-3709831265"
+    )]
     async fn test_connection_reset_is_retried() {
         let retry = RetryConfig {
             backoff: Default::default(),

@@ -24,7 +24,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt, Stream};
+use futures_util::{FutureExt, Stream};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -105,16 +105,18 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         self.inner.get_ranges(location, ranges).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.delete(location).await
-    }
-
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(locations)
+        let inner = Arc::clone(&self.inner);
+        let fut = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .map(move |permit| {
+                let s = inner.delete_stream(locations);
+                PermitWrapper::new(s, permit.unwrap())
+            });
+        fut.into_stream().flatten().boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -243,7 +245,7 @@ mod tests {
     use crate::integration::*;
     use crate::limit::LimitStore;
     use crate::memory::InMemory;
-    use futures::stream::StreamExt;
+    use futures_util::stream::StreamExt;
     use std::pin::Pin;
     use std::time::Duration;
     use tokio::time::timeout;

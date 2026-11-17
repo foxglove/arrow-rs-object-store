@@ -28,16 +28,19 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, stream::BoxStream};
+use futures_util::{FutureExt, StreamExt, stream::BoxStream};
 use std::time::Duration;
 
 /// Configuration settings for throttled store
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThrottleConfig {
-    /// Sleep duration for every call to [`delete`](ThrottledStore::delete).
+    /// Sleep duration for every call to [`delete`], or every element in [`delete_stream`].
     ///
     /// Sleeping is done before the underlying store is called and independently of the success of
     /// the operation.
+    ///
+    /// [`delete`]: crate::ObjectStoreExt::delete
+    /// [`delete_stream`]: ThrottledStore::delete_stream
     pub wait_delete_per_call: Duration,
 
     /// Sleep duration for every byte received during [`get_opts`](ThrottledStore::get_opts).
@@ -193,12 +196,6 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
         self.inner.get_ranges(location, ranges).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        sleep(self.config().wait_delete_per_call).await;
-
-        self.inner.delete(location).await
-    }
-
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
@@ -215,7 +212,7 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let stream = self.inner.list(prefix);
         let config = Arc::clone(&self.config);
-        futures::stream::once(async move {
+        futures_util::stream::once(async move {
             let config = *config.lock();
             let wait_list_per_entry = config.wait_list_per_entry;
             sleep(config.wait_list_per_call).await;
@@ -232,7 +229,7 @@ impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let stream = self.inner.list_with_offset(prefix, offset);
         let config = Arc::clone(&self.config);
-        futures::stream::once(async move {
+        futures_util::stream::once(async move {
             let config = *config.lock();
             let wait_list_per_entry = config.wait_list_per_entry;
             sleep(config.wait_list_per_call).await;
@@ -302,7 +299,7 @@ where
     stream
         .then(move |result| {
             let delay = result.as_ref().ok().map(&delay).unwrap_or_default();
-            sleep(delay).then(|_| futures::future::ready(result))
+            sleep(delay).then(|_| futures_util::future::ready(result))
         })
         .boxed()
 }
@@ -311,6 +308,14 @@ where
 impl<T: MultipartStore> MultipartStore for ThrottledStore<T> {
     async fn create_multipart(&self, path: &Path) -> Result<MultipartId> {
         self.inner.create_multipart(path).await
+    }
+
+    async fn create_multipart_opts(
+        &self,
+        path: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<MultipartId> {
+        self.inner.create_multipart_opts(path, opts).await
     }
 
     async fn put_part(
@@ -371,7 +376,7 @@ mod tests {
     use crate::GetResultPayload;
     use crate::ObjectStoreExt;
     use crate::{integration::*, memory::InMemory};
-    use futures::TryStreamExt;
+    use futures_util::TryStreamExt;
     use tokio::time::Duration;
     use tokio::time::Instant;
 
@@ -403,6 +408,8 @@ mod tests {
         copy_if_not_exists(&store).await;
         stream_get(&store).await;
         multipart(&store, &store).await;
+        multipart_with_opts(&store, &store).await;
+        multipart_put_part_out_of_order(&store, &store).await;
     }
 
     #[tokio::test]
@@ -561,7 +568,7 @@ mod tests {
 
         // create new entries
         for i in 0..n_entries {
-            let path = prefix.child(i.to_string().as_str());
+            let path = prefix.clone().join(i.to_string().as_str());
             store.put(&path, "bar".into()).await.unwrap();
         }
 
@@ -583,7 +590,7 @@ mod tests {
 
         // materialize the paths so that the throttle time for listing is not counted
         let paths = store.list(Some(&prefix)).collect::<Vec<_>>().await;
-        let paths = futures::stream::iter(paths)
+        let paths = futures_util::stream::iter(paths)
             .map(|x| x.map(|m| m.location))
             .boxed();
 

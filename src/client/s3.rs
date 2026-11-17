@@ -1,3 +1,4 @@
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -16,15 +17,16 @@
 
 //! The list and multipart API used by both GCS and S3
 
+use crate::client::list::parse_key;
+use crate::list::{InvalidKey, InvalidKeyHandling};
 use crate::multipart::PartId;
-use crate::path::Path;
 use crate::{ListResult, ObjectMeta, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ListResponse {
+pub(crate) struct ListResponse {
     #[serde(default)]
     pub contents: Vec<ListContents>,
     #[serde(default)]
@@ -33,38 +35,45 @@ pub struct ListResponse {
     pub next_continuation_token: Option<String>,
 }
 
-impl TryFrom<ListResponse> for ListResult {
-    type Error = crate::Error;
+/// Converts a list response into a [`ListResult`], along with the entries omitted
+/// from it under [`InvalidKeyHandling::Skip`]
+pub(crate) fn to_list_result(
+    value: ListResponse,
+    handling: InvalidKeyHandling,
+) -> Result<(ListResult, Vec<InvalidKey>)> {
+    let mut invalid_keys = Vec::new();
 
-    fn try_from(value: ListResponse) -> Result<Self> {
-        let common_prefixes = value
-            .common_prefixes
-            .into_iter()
-            .map(|x| Ok(Path::parse(x.prefix)?))
-            .collect::<Result<_>>()?;
+    let common_prefixes = value
+        .common_prefixes
+        .into_iter()
+        .filter_map(|x| parse_key(x.prefix, handling, &mut invalid_keys).transpose())
+        .collect::<Result<_>>()?;
 
-        let objects = value
-            .contents
-            .into_iter()
-            .map(TryFrom::try_from)
-            .collect::<Result<_>>()?;
+    let objects = value
+        .contents
+        .into_iter()
+        .filter_map(|x| to_object_meta(x, handling, &mut invalid_keys).transpose())
+        .collect::<Result<_>>()?;
 
-        Ok(Self {
+    Ok((
+        ListResult {
             common_prefixes,
             objects,
-        })
-    }
+            extensions: Default::default(),
+        },
+        invalid_keys,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ListPrefix {
+pub(crate) struct ListPrefix {
     pub prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ListContents {
+pub(crate) struct ListContents {
     pub key: String,
     pub size: u64,
     pub last_modified: DateTime<Utc>,
@@ -72,18 +81,23 @@ pub struct ListContents {
     pub e_tag: Option<String>,
 }
 
-impl TryFrom<ListContents> for ObjectMeta {
-    type Error = crate::Error;
+/// Returns `Ok(None)` if the key was skipped, see [`parse_key`]
+fn to_object_meta(
+    value: ListContents,
+    handling: InvalidKeyHandling,
+    invalid_keys: &mut Vec<InvalidKey>,
+) -> Result<Option<ObjectMeta>> {
+    let Some(location) = parse_key(value.key, handling, invalid_keys)? else {
+        return Ok(None);
+    };
 
-    fn try_from(value: ListContents) -> Result<Self> {
-        Ok(Self {
-            location: Path::parse(value.key)?,
-            last_modified: value.last_modified,
-            size: value.size,
-            e_tag: value.e_tag,
-            version: None,
-        })
-    }
+    Ok(Some(ObjectMeta {
+        location,
+        last_modified: value.last_modified,
+        size: value.size,
+        e_tag: value.e_tag,
+        version: None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,12 +106,16 @@ pub(crate) struct InitiateMultipartUploadResult {
     pub upload_id: String,
 }
 
-#[cfg(feature = "aws")]
+#[cfg(feature = "aws-base")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CopyPartResult {
     #[serde(rename = "ETag")]
     pub e_tag: String,
+    #[serde(default, rename = "ChecksumSHA256")]
+    pub checksum_sha256: Option<String>,
+    #[serde(default, rename = "ChecksumCRC64NVME")]
+    pub checksum_crc64nvme: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +129,8 @@ pub(crate) struct PartMetadata {
     pub e_tag: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_crc64nvme: Option<String>,
 }
 
 impl From<Vec<PartId>> for CompleteMultipartUpload {
@@ -125,12 +145,14 @@ impl From<Vec<PartId>> for CompleteMultipartUpload {
                     Err(_) => PartMetadata {
                         e_tag: part.content_id.clone(),
                         checksum_sha256: None,
+                        checksum_crc64nvme: None,
                     },
                 };
                 MultipartPart {
                     e_tag: md.e_tag,
                     part_number: part_idx + 1,
                     checksum_sha256: md.checksum_sha256,
+                    checksum_crc64nvme: md.checksum_crc64nvme,
                 }
             })
             .collect();
@@ -147,6 +169,9 @@ pub(crate) struct MultipartPart {
     #[serde(rename = "ChecksumSHA256")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha256: Option<String>,
+    #[serde(rename = "ChecksumCRC64NVME")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_crc64nvme: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,4 +179,141 @@ pub(crate) struct MultipartPart {
 pub(crate) struct CompleteMultipartUploadResult {
     #[serde(rename = "ETag")]
     pub e_tag: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A page mixing representable keys with ones `Path` cannot represent: an empty
+    /// segment, a relative segment, an ASCII control character, and a leading `/`
+    /// (which `Path::parse` would strip). A trailing `/` is normalized, not rejected.
+    /// `CommonPrefixes` holds one of each kind too.
+    const LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ListBucketResult>
+    <Name>bucket</Name>
+    <Prefix>logs/</Prefix>
+    <KeyCount>6</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <Delimiter>/</Delimiter>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>token-abc</NextContinuationToken>
+    <Contents>
+        <Key>logs/a.mcap</Key>
+        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+        <ETag>\"etag-a\"</ETag>
+        <Size>100</Size>
+    </Contents>
+    <Contents>
+        <Key>logs//b.mcap</Key>
+        <LastModified>2024-01-02T00:00:00.000Z</LastModified>
+        <ETag>\"etag-b\"</ETag>
+        <Size>200</Size>
+    </Contents>
+    <Contents>
+        <Key>logs/../c.mcap</Key>
+        <LastModified>2024-01-03T00:00:00.000Z</LastModified>
+        <ETag>\"etag-c\"</ETag>
+        <Size>300</Size>
+    </Contents>
+    <Contents>
+        <Key>logs/d\u{7}.mcap</Key>
+        <LastModified>2024-01-04T00:00:00.000Z</LastModified>
+        <ETag>\"etag-d\"</ETag>
+        <Size>400</Size>
+    </Contents>
+    <Contents>
+        <Key>/logs/a.mcap</Key>
+        <LastModified>2024-01-05T00:00:00.000Z</LastModified>
+        <ETag>\"etag-e\"</ETag>
+        <Size>500</Size>
+    </Contents>
+    <Contents>
+        <Key>logs/</Key>
+        <LastModified>2024-01-06T00:00:00.000Z</LastModified>
+        <ETag>\"etag-f\"</ETag>
+        <Size>0</Size>
+    </Contents>
+    <CommonPrefixes>
+        <Prefix>logs/good/</Prefix>
+    </CommonPrefixes>
+    <CommonPrefixes>
+        <Prefix>bad//prefix/</Prefix>
+    </CommonPrefixes>
+</ListBucketResult>";
+
+    fn parse() -> ListResponse {
+        quick_xml::de::from_str(LIST_RESPONSE).unwrap()
+    }
+
+    #[test]
+    fn list_result_error_on_invalid_key() {
+        let err = to_list_result(parse(), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_result_skip_invalid_key() {
+        let response = parse();
+        let token = response.next_continuation_token.clone();
+
+        let (result, invalid_keys) = to_list_result(response, InvalidKeyHandling::Skip).unwrap();
+
+        // The continuation token survives a page that skipped entries
+        assert_eq!(token.as_deref(), Some("token-abc"));
+
+        // A trailing `/` is still normalized away rather than reported invalid
+        let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
+        assert_eq!(objects, vec!["logs/a.mcap", "logs"]);
+        assert_eq!(result.objects[0].size, 100);
+        assert_eq!(result.objects[0].e_tag.as_deref(), Some("\"etag-a\""));
+
+        let prefixes: Vec<_> = result.common_prefixes.iter().map(|x| x.as_ref()).collect();
+        assert_eq!(prefixes, vec!["logs/good"]);
+
+        // Raw keys are reported verbatim, prefixes ahead of objects
+        let keys: Vec<_> = invalid_keys.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "bad//prefix/",
+                "logs//b.mcap",
+                "logs/../c.mcap",
+                "logs/d\u{7}.mcap",
+                "/logs/a.mcap",
+            ]
+        );
+
+        // The leading-slash key is reported as non-normalizable, not as a parse failure
+        let source = &invalid_keys.last().unwrap().source;
+        assert!(
+            matches!(source, crate::path::Error::NotNormalized { path } if path == "/logs/a.mcap"),
+            "unexpected source: {source}"
+        );
+    }
+
+    /// A leading `/` alone is enough to fail the page under [`InvalidKeyHandling::Error`]
+    #[test]
+    fn list_result_error_on_non_normalized_key() {
+        const RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ListBucketResult>
+    <Name>bucket</Name>
+    <Contents>
+        <Key>/logs/a.mcap</Key>
+        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+        <ETag>\"etag-a\"</ETag>
+        <Size>100</Size>
+    </Contents>
+</ListBucketResult>";
+
+        let response: ListResponse = quick_xml::de::from_str(RESPONSE).unwrap();
+        let err = to_list_result(response, InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
 }

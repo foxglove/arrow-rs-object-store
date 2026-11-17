@@ -17,6 +17,9 @@
 
 //! An object store implementation for Google Cloud Storage
 //!
+//! See the [Feature Flags](crate#feature-flags) section for the difference
+//! between the `gcp` and `gcp-base` features.
+//!
 //! ## Multipart uploads
 //!
 //! [Multipart uploads](https://cloud.google.com/storage/docs/multipart-uploads)
@@ -37,10 +40,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::client::CredentialProvider;
+use crate::CopyOptions;
+use crate::client::{CredentialProvider, crypto_provider};
 use crate::gcp::credential::GCSAuthorizer;
-use crate::signer::Signer;
-use crate::{CopyMode, CopyOptions};
+use crate::retry::{MultipartRetry, RetryPolicy};
+use crate::signer::{SignedUrlOptions, Signer};
+use crate::util::validate_signed_url_extras;
 use crate::{
     GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart, multipart::PartId,
@@ -48,7 +53,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
-use futures::stream::{BoxStream, StreamExt};
+use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use http::Method;
 use url::Url;
 
@@ -113,6 +118,7 @@ struct UploadState {
     path: Path,
     multipart_id: MultipartId,
     parts: Parts,
+    retry_policy: Option<Arc<dyn RetryPolicy>>,
 }
 
 #[async_trait]
@@ -122,12 +128,21 @@ impl MultipartUpload for GCSMultipartUpload {
         self.part_idx += 1;
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let part = state
-                .client
-                .put_part(&state.path, &state.multipart_id, idx, payload)
-                .await?;
-            state.parts.put(idx, part);
-            Ok(())
+            let mut retry = MultipartRetry::new(state.retry_policy.clone());
+            loop {
+                match state
+                    .client
+                    .put_part(&state.path, &state.multipart_id, idx, payload.clone())
+                    .await
+                {
+                    Ok(part) => {
+                        state.parts.put(idx, part);
+                        return Ok(());
+                    }
+                    Err(error) if retry.should_retry(&error).await => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         })
     }
 
@@ -164,6 +179,7 @@ impl ObjectStore for GoogleCloudStorage {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let retry_policy = opts.retry_policy();
         let upload_id = self.client.multipart_initiate(location, opts).await?;
 
         Ok(Box::new(GCSMultipartUpload {
@@ -173,6 +189,7 @@ impl ObjectStore for GoogleCloudStorage {
                 path: location.clone(),
                 multipart_id: upload_id.clone(),
                 parts: Default::default(),
+                retry_policy,
             }),
         }))
     }
@@ -181,25 +198,34 @@ impl ObjectStore for GoogleCloudStorage {
         self.client.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.delete_request(location).await
-    }
-
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let client = Arc::clone(&self.client);
         locations
-            .map(move |location| {
+            .try_chunks(1_000)
+            .map(move |locations| {
                 let client = Arc::clone(&client);
                 async move {
-                    let location = location?;
-                    client.delete_request(&location).await?;
-                    Ok(location)
+                    // Early return the error. We ignore the paths that have already been
+                    // collected into the chunk.
+                    let mut locations = locations.map_err(|e| e.1)?;
+                    // A single DELETE reports missing objects as `NotFound`, which the
+                    // multi-object delete API doesn't.
+                    if locations.len() == 1 {
+                        let location = locations.pop().unwrap();
+                        let result = client.delete_request(&location).await.map(|_| location);
+                        return Ok(futures_util::stream::iter(vec![result]));
+                    }
+                    client
+                        .bulk_delete_request(locations)
+                        .await
+                        .map(futures_util::stream::iter)
                 }
             })
-            .buffered(10)
+            .buffered(20)
+            .try_flatten()
             .boxed()
     }
 
@@ -225,19 +251,76 @@ impl ObjectStore for GoogleCloudStorage {
             extensions: _,
         } = options;
 
-        match mode {
-            CopyMode::Overwrite => self.client.copy_request(from, to, true).await,
-            CopyMode::Create => self.client.copy_request(from, to, false).await,
-        }
+        self.client.copy_request(from, to, mode).await
     }
 }
 
 #[async_trait]
 impl MultipartStore for GoogleCloudStorage {
+    /// Create a new multipart upload, returning its [`MultipartId`].
+    ///
+    /// This is the low-level [`MultipartStore`] API, which gives direct control
+    /// over individual parts. See [`ObjectStoreExt::put_multipart`] for a
+    /// higher-level API that handles parts automatically.
+    ///
+    /// # Example
+    ///
+    /// Create a multipart upload, upload two parts, and finalize it by calling
+    /// [`complete_multipart`]:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use object_store::{gcp::GoogleCloudStorageBuilder, multipart::MultipartStore, path::Path, PutPayload};
+    /// #
+    /// let gcs = GoogleCloudStorageBuilder::new()
+    ///     .with_bucket_name("my-bucket")
+    ///     .with_service_account_path("/path/to/service-account.json")
+    ///     .build()?;
+    ///
+    /// let path = Path::from("data/large_file");
+    ///
+    /// // Start the upload, obtaining an id used to reference it in later calls
+    /// let id = gcs.create_multipart(&path).await?;
+    ///
+    /// // Upload the individual parts. Every part except the last must be at least
+    /// // 5 MiB.
+    /// let part0 = gcs
+    ///     .put_part(&path, &id, 0, PutPayload::from(vec![0; 5 * 1024 * 1024]))
+    ///     .await?;
+    /// let part1 = gcs
+    ///     .put_part(&path, &id, 1, PutPayload::from("the final part"))
+    ///     .await?;
+    ///
+    /// // Finalize the upload. The parts must be provided in `part_idx` order.
+    /// gcs.complete_multipart(&path, &id, vec![part0, part1]).await?;
+    /// #     Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Every part except the last must be at least 5 MiB. Parts may be uploaded
+    /// concurrently and in any order, provided each is given the correct
+    /// `part_idx`. See [Cloud Storage multipart upload limits] for the full set of
+    /// size and count constraints.
+    ///
+    /// To discard an upload instead of completing it, call
+    /// [`abort_multipart`] with the same `id`.
+    ///
+    /// [`ObjectStoreExt::put_multipart`]: crate::ObjectStoreExt::put_multipart
+    /// [`complete_multipart`]: MultipartStore::complete_multipart
+    /// [`abort_multipart`]: MultipartStore::abort_multipart
+    /// [Cloud Storage multipart upload limits]: https://docs.cloud.google.com/storage/docs/xml-api/post-object-complete
     async fn create_multipart(&self, path: &Path) -> Result<MultipartId> {
         self.client
             .multipart_initiate(path, PutMultipartOptions::default())
             .await
+    }
+
+    async fn create_multipart_opts(
+        &self,
+        path: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<MultipartId> {
+        self.client.multipart_initiate(path, opts).await
     }
 
     async fn put_part(
@@ -267,12 +350,38 @@ impl MultipartStore for GoogleCloudStorage {
 #[async_trait]
 impl Signer for GoogleCloudStorage {
     async fn signed_url(&self, method: Method, path: &Path, expires_in: Duration) -> Result<Url> {
+        self.signed_url_opts(method, path, expires_in, &SignedUrlOptions::default())
+            .await
+    }
+
+    /// Create a signed URL, additionally folding the query parameters and headers in `options`
+    /// into the signature.
+    ///
+    /// `extra_query` lets callers sign query parameters the recipient must send, and
+    /// `signed_headers` binds request headers (e.g. `content-type`) to the signature; the
+    /// recipient must send exactly these headers and values.
+    async fn signed_url_opts(
+        &self,
+        method: Method,
+        path: &Path,
+        expires_in: Duration,
+        options: &SignedUrlOptions,
+    ) -> Result<Url> {
         if expires_in.as_secs() > 604800 {
             return Err(crate::Error::Generic {
                 store: STORE,
                 source: "Expiration Time can't be longer than 604800 seconds (7 days).".into(),
             });
         }
+
+        // Validate the caller-provided extras up front, rejecting reserved query parameters and
+        // headers controlled by the signer.
+        validate_signed_url_extras(
+            STORE,
+            &options.extra_query,
+            &options.signed_headers,
+            "x-goog-",
+        )?;
 
         let config = self.client.config();
         let path_url = config.path_url(path);
@@ -284,8 +393,17 @@ impl Signer for GoogleCloudStorage {
         let signing_credentials = self.signing_credentials().get_credential().await?;
         let authorizer = GCSAuthorizer::new(signing_credentials);
 
+        let crypto = crypto_provider(self.client.config().crypto.as_deref())?;
         authorizer
-            .sign(method, &mut url, expires_in, &self.client)
+            .sign_with(
+                crypto,
+                method,
+                &mut url,
+                &options.extra_query,
+                &options.signed_headers,
+                expires_in,
+                &self.client,
+            )
             .await?;
 
         Ok(url)
@@ -318,9 +436,15 @@ mod test {
     #[tokio::test]
     async fn gcs_test() {
         maybe_skip_integration!();
-        let integration = GoogleCloudStorageBuilder::from_env().build().unwrap();
+        // tag the extensions of every HTTP response with a marker,
+        // allowing response_extensions to verify their propagation
+        let integration = GoogleCloudStorageBuilder::from_env()
+            .with_http_connector(MarkerHttpConnector::default())
+            .build()
+            .unwrap();
 
         put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
         list_uses_directories_correctly(&integration).await;
         list_with_delimiter(&integration).await;
         rename_and_copy(&integration).await;
@@ -332,6 +456,8 @@ mod test {
             // https://github.com/fsouza/fake-gcs-server/issues/852
             stream_get(&integration).await;
             multipart(&integration, &integration).await;
+            multipart_with_opts(&integration, &integration).await;
+            multipart_put_part_out_of_order(&integration, &integration).await;
             multipart_race_condition(&integration, true).await;
             multipart_out_of_order(&integration).await;
             list_paginated(&integration, &integration).await;
@@ -341,8 +467,13 @@ mod test {
             // Fake GCS server doesn't currently support attributes
             put_get_attributes(&integration).await;
         }
+
+        // Fake GCS server does not yet implement XML Multipart uploads
+        let test_multipart = integration.client.config().base_url == DEFAULT_GCS_BASE_URL;
+        response_extensions(&integration, test_multipart).await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     #[ignore]
     async fn gcs_test_sign() {

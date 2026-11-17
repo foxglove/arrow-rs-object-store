@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
@@ -80,21 +80,23 @@
     doc = "* Local filesystem: [`LocalFileSystem`](local::LocalFileSystem)"
 )]
 #![cfg_attr(
-    feature = "gcp",
+    feature = "gcp-base",
     doc = "* [`gcp`]: [Google Cloud Storage](https://cloud.google.com/storage/) support. See [`GoogleCloudStorageBuilder`](gcp::GoogleCloudStorageBuilder)"
 )]
 #![cfg_attr(
-    feature = "aws",
+    feature = "aws-base",
     doc = "* [`aws`]: [Amazon S3](https://aws.amazon.com/s3/). See [`AmazonS3Builder`](aws::AmazonS3Builder)"
 )]
 #![cfg_attr(
-    feature = "azure",
+    feature = "azure-base",
     doc = "* [`azure`]: [Azure Blob Storage](https://azure.microsoft.com/en-gb/services/storage/blobs/). See [`MicrosoftAzureBuilder`](azure::MicrosoftAzureBuilder)"
 )]
 #![cfg_attr(
-    feature = "http",
+    feature = "http-base",
     doc = "* [`http`]: [HTTP/WebDAV Storage](https://datatracker.ietf.org/doc/html/rfc2518). See [`HttpBuilder`](http::HttpBuilder)"
 )]
+//!
+//! See [Feature Flags](#feature-flags) for the full set of flags.
 //!
 //! # Why not a Filesystem Interface?
 //!
@@ -116,6 +118,8 @@
 //!
 //! [`BufReader`]: buffered::BufReader
 //! [`BufWriter`]: buffered::BufWriter
+//! [`Read`]: std::io::Read
+//! [`Seek`]: std::io::Seek
 //!
 //! # Adapters
 //!
@@ -172,7 +176,7 @@
 //! # use object_store::local::LocalFileSystem;
 //! # use std::sync::Arc;
 //! # use object_store::{path::Path, ObjectStore};
-//! # use futures::stream::StreamExt;
+//! # use futures_util::stream::StreamExt;
 //! # // use LocalFileSystem for example
 //! # fn get_object_store() -> Arc<dyn ObjectStore> {
 //! #   Arc::new(LocalFileSystem::new())
@@ -213,7 +217,7 @@
 //! from remote storage or files in the local filesystem as a stream.
 //!
 //! ```ignore-wasm32
-//! # use futures::TryStreamExt;
+//! # use futures_util::TryStreamExt;
 //! # use object_store::local::LocalFileSystem;
 //! # use std::sync::Arc;
 //! #  use bytes::Bytes;
@@ -259,6 +263,9 @@
 //!
 //! Use the [`ObjectStoreExt::put`] method to atomically write data.
 //!
+//! To upload large objects without buffering them entirely in [`PutPayload`],
+//! see [Multipart Upload](#multipart-upload) below.
+//!
 //! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
 //! # use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -279,7 +286,15 @@
 //! # Multipart Upload
 //!
 //! Use the [`ObjectStoreExt::put_multipart`] / [`ObjectStore::put_multipart_opts`] method to atomically write a large
-//! amount of data
+//! amount of data in multiple parts, without buffering the entire object in memory.
+//! [`WriteMultipart`] uploads fixed size parts in parallel as data is written.
+//!
+//! [`BufWriter`](buffered::BufWriter) provides an [`AsyncWrite`]
+//! interface that automatically picks between a single and multipart upload
+//! based on the amount of data written.
+//!
+//! [`AsyncWrite`]: tokio::io::AsyncWrite
+//! [`BufWriter`]: buffered::BufWriter
 //!
 //! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
@@ -515,15 +530,139 @@
 //! [Apache Iceberg]: https://iceberg.apache.org/
 //! [Delta Lake]: https://delta.io/
 //!
+//! # Feature Flags
+//!
+//! The feature set is layered so that you can pick an object store
+//! implementation, its HTTP transport, and its cryptography provider
+//! independently:
+//!
+//! * `cloud-base` shared cloud implementation (XML/JSON parsing,
+//!   credentials, retry, etc.) and intentionally does *not* depend on
+//!   `reqwest` or a cryptography provider.
+//! * `reqwest` enables the built-in [`reqwest`]-based [`HttpConnector`].
+//! * `aws-lc-rs` and `ring` each provide a bundled [`client::CryptoProvider`].
+//! * `<provider>-base` (`aws-base`, `azure-base`, `gcp-base`, `http-base`)
+//!   adds the implementation specific logic on top of `cloud-base` without pulling in
+//!   `reqwest` or a cryptography provider.
+//! * `<provider>` (`aws`, `azure`, `gcp`, `http`) is the batteries-included
+//!   feature for `<provider>-base` + `reqwest` (with `rustls`) + the default
+//!   `aws-lc-rs` cryptography provider, and is the typical choice.
+//!
+//! ## Implementation specific features
+//!
+//! | Feature | Enables | Notes |
+//! | --- | --- | --- |
+//! | `aws` | `aws-base` + `reqwest` + `aws-lc-rs` | Amazon S3 with the built-in HTTP transport. |
+//! | `azure` | `azure-base` + `reqwest` + `aws-lc-rs` | Azure Blob Storage with the built-in HTTP transport. |
+//! | `gcp` | `gcp-base` + `reqwest` + `aws-lc-rs` | Google Cloud Storage with the built-in HTTP transport. |
+//! | `http` | `http-base` + `reqwest` + `aws-lc-rs` | HTTP/WebDAV with the built-in HTTP transport. |
+//! | `aws-base` |  | S3 without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `azure-base` |  | Azure without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `gcp-base` |  | GCS without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `http-base` |  | HTTP/WebDAV without `reqwest`; supply your own [`HttpConnector`]. |
+//!
+//! ## Transport and crypto features
+//!
+//! | Feature | Description |
+//! | --- | --- |
+//! | `reqwest` | Enables the [`reqwest`]-based [`HttpConnector`]. Enabled automatically by `aws`, `azure`, `gcp`, and `http`. |
+//! | `aws-lc-rs` | Bundled [`aws-lc-rs`]-based [`client::CryptoProvider`]. The default for the batteries-included provider features. |
+//! | `ring` | Bundled [`ring`]-based [`client::CryptoProvider`], e.g. for WASM targets. |
+//! | `cloud-base` | Shared cloud-provider implementation. Enabled automatically by `*-base` features; usually not enabled directly. |
+//!
+//! ## Other features
+//!
+//! | Feature | Description |
+//! | --- | --- |
+//! | `fs` *(default)* | Local filesystem store via [`LocalFileSystem`](local::LocalFileSystem). |
+//! | `tokio` | Enables Tokio-based utilities such as [`BufReader`](buffered::BufReader) and [`BufWriter`](buffered::BufWriter). Pulled in automatically by `fs` and the `*-base` features. |
+//! | `integration` | Exposes the [`integration`] module, a reusable test suite for verifying custom [`ObjectStore`] implementations. Not API-stable. |
+//!
+//! ## Selecting a `reqwest` TLS backend
+//!
+//! `reqwest` needs a TLS backend to compile, so whenever you enable the `reqwest` feature directly
+//! you must also enable one of `reqwest`'s TLS features:
+//!
+//! | reqwest feature | TLS stack | Notes |
+//! | --- | --- | --- |
+//! | `reqwest/rustls` | [rustls] with [`aws-lc-rs`] | enables `aws-lc-rs`. This is what `aws`/`azure`/`gcp`/`http` enable. |
+//! | `reqwest/native-tls` | the platform's native TLS (OpenSSL / SChannel / Secure Transport) | enables neither `rustls` nor `aws-lc-rs`. |
+//! | `reqwest/rustls-no-provider` | [rustls] with no bundled provider | enables neither provider; you must install one at runtime, e.g. `rustls::crypto::ring::default_provider().install_default()`. |
+//!
+//! ## Feature examples
+//!
+//! S3 implementation only; user provides the HTTP connector and crypto provider:
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base"] }
+//! ```
+//!
+//! S3 implementation + `reqwest` + `aws-lc-rs` signing (equivalent to the `aws` feature):
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base", "reqwest", "reqwest/rustls", "aws-lc-rs"] }
+//! ```
+//!
+//! S3 implementation + `reqwest` with native TLS + `ring` signing (no `aws-lc-rs` in the dependency tree):
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base", "reqwest", "reqwest/native-tls", "ring"] }
+//! ```
+//!
+//! [rustls]: https://crates.io/crates/rustls/
+//!
+//! # Cryptography
+//!
+//! Request signing (e.g. AWS SigV4 or GCP service-account signing) requires a
+//! [`client::CryptoProvider`]. The `aws`, `gcp`, and `azure` features
+//! use [`aws-lc-rs`], matching `reqwest`'s default so that applications do not end up with
+//! two crypto stacks.
+//!
+//! If you wish to use [`ring`] (e.g. to support WASM targets), use the
+//! `*-base` feature flags, e.g. `aws-base`, and then enable the `ring` feature.
+//!
+//! When enabling the `aws-lc-rs` feature without the built-in `reqwest`
+//! transport (e.g. `aws-base` + `aws-lc-rs` with a custom [`HttpConnector`]),
+//! you must also select an [`aws-lc-rs`] backend, as `object_store` does not
+//! pick one for you.
+//! For example enable `aws-lc-rs/aws-lc-sys` (or `fips` / `non-fips`).
+//!
+//! If both `ring` and `aws-lc-rs` are enabled, `aws-lc-rs` is used by default.
+//!
+//! You can also implement a custom [`client::CryptoProvider`] to use your own cryptographic library.
+//!
+//! This signing provider is independent of the TLS crypto provider used by the
+//! built-in `reqwest` transport — see
+//! [Selecting a `reqwest` TLS backend](#selecting-a-reqwest-tls-backend). The
+//! only combination that needs the provider registered manually (e.g.
+//! `rustls::crypto::ring::default_provider().install_default()` in your `main`)
+//! is `reqwest/rustls-no-provider`; `reqwest/rustls` and `reqwest/native-tls`
+//! configure their TLS stack automatically.
+//!
+//! [`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs/
+//! [`ring`]: https://crates.io/crates/ring/
+//!
 //! # TLS Certificates
 //!
-//! Stores that use HTTPS/TLS (this is true for most cloud stores) can choose the source of their [CA]
-//! certificates. By default the system-bundled certificates are used (see
-//! [`rustls-native-certs`]). The `tls-webpki-roots` feature switch can be used to also bundle Mozilla's
-//! root certificates with the library/application (see [`webpki-roots`]).
+//! Stores that use HTTPS/TLS (this is true for most cloud stores) can choose how certificates are validated.
+//!
+//! By default [`rustls-platform-verifier`] is used to verify certificates using the system's certificate
+//! facilities. Alternatively, this functionality can be disabled using
+//! [`ClientOptions::with_no_system_certificates`] and certificates manually registered using
+//! [`ClientOptions::with_root_certificate`].
+//!
+//! These could be a custom CA chain, or alternatively an alternative trust store, e.g. [`webpki-roots`].
+//!
+//! ```ignore-wasm32
+//! # #[cfg(feature = "aws")] {
+//! use object_store::{ClientOptions, Certificate};
+//!
+//! let mut options = ClientOptions::default().with_no_system_certificates(true);
+//! for root_cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+//!     options = options.with_root_certificate(Certificate::from_der(root_cert.as_ref()).unwrap());
+//! }
+//! # }
+//! ```
 //!
 //! [CA]: https://en.wikipedia.org/wiki/Certificate_authority
-//! [`rustls-native-certs`]: https://crates.io/crates/rustls-native-certs/
+//! [`rustls-platform-verifier`]: https://crates.io/crates/rustls-platform-verifier/
 //! [`webpki-roots`]: https://crates.io/crates/webpki-roots
 //!
 //! # Customizing HTTP Clients
@@ -531,22 +670,56 @@
 //! Many [`ObjectStore`] implementations permit customization of the HTTP client via
 //! the [`HttpConnector`] trait and utilities in the [`client`] module.
 //! Examples include injecting custom HTTP headers or using an alternate
-//! tokio Runtime I/O requests.
+//! tokio Runtime for I/O requests. To replace `reqwest` entirely (rather than
+//! tweak the bundled transport) see [Disabling `reqwest`](#disabling-reqwest).
 //!
 //! [`HttpConnector`]: client::HttpConnector
+//!
+//! # Disabling `reqwest`
+//!
+//! The `aws`, `azure`, `gcp`, and `http` features each bundle a
+//! [`reqwest`]-based HTTP transport, which is the right choice for most
+//! applications. If you would rather supply your own HTTP client — for example
+//! to share an existing client, to target a platform where `reqwest` does not
+//! compile (such as `wasm32-wasip1`), or to keep `reqwest` out of your
+//! dependency tree — use the matching `*-base` feature and provide an
+//! [`HttpConnector`](client::HttpConnector) at builder time.
+//!
+//! Remember to disable the default features so that `fs` (and its transitive
+//! dependencies) is not pulled in:
+//!
+//! ```toml
+//! [dependencies]
+//! object_store = { version = "0.13", default-features = false, features = ["aws-base"] }
+//! ```
+//!
+//! ```ignore
+//! use object_store::aws::AmazonS3Builder;
+//!
+//! let store = AmazonS3Builder::from_env()
+//!     // `my_connector` is your own `impl HttpConnector`
+//!     .with_http_connector(my_connector)
+//!     .build()?;
+//! ```
+//!
+//! See [Feature Flags](#feature-flags) above for the full set of flags.
+//!
+//! [`reqwest`]: https://crates.io/crates/reqwest
 
-#[cfg(feature = "aws")]
+#[cfg(feature = "aws-base")]
 pub mod aws;
-#[cfg(feature = "azure")]
+#[cfg(feature = "azure-base")]
 pub mod azure;
+#[cfg(feature = "tokio")]
 pub mod buffered;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod chunked;
 pub mod delimited;
-#[cfg(feature = "gcp")]
+#[cfg(feature = "gcp-base")]
 pub mod gcp;
-#[cfg(feature = "http")]
+#[cfg(feature = "http-base")]
 pub mod http;
+#[cfg(feature = "tokio")]
 pub mod limit;
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 pub mod local;
@@ -554,23 +727,30 @@ pub mod memory;
 pub mod path;
 pub mod prefix;
 pub mod registry;
-#[cfg(feature = "cloud")]
+#[cfg(any(feature = "aws-base", feature = "azure-base", feature = "gcp-base"))]
+pub mod retry;
+#[cfg(feature = "cloud-base")]
 pub mod signer;
+#[cfg(feature = "tokio")]
 pub mod throttle;
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "cloud-base")]
 pub mod client;
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "cloud-base")]
 pub use client::{
     ClientConfigKey, ClientOptions, CredentialProvider, StaticCredentialProvider,
     backoff::BackoffConfig, retry::RetryConfig,
 };
 
-#[cfg(all(feature = "cloud", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "cloud-base",
+    feature = "reqwest",
+    not(target_arch = "wasm32")
+))]
 pub use client::Certificate;
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "cloud-base")]
 mod config;
 
 mod tags;
@@ -605,10 +785,8 @@ use crate::util::maybe_spawn_blocking;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
 use std::fmt::{Debug, Formatter};
-#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
-use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -631,6 +809,10 @@ pub type MultipartId = String;
 /// The [`ObjectStoreExt`] acts as an API/contract between `object_store` and
 /// the store _users_ and provides additional methods that may be simpler to use
 /// but overlap in functionality with [`ObjectStore`].
+///
+/// # Clone
+/// If a store implements [`Clone`], that will only clone the handle to the underlying data. It will NOT clone/fork the
+/// actual key-value data. Hence, the cloned instance and the original instance share the same state.
 ///
 /// # Minimal Default Implementations
 /// There are only a few default implementations for methods in this trait by
@@ -694,6 +876,47 @@ pub type MultipartId = String;
 ///
 /// To automatically detect this issue, use
 /// [`#[deny(clippy::missing_trait_methods)]`](https://rust-lang.github.io/rust-clippy/master/index.html#missing_trait_methods).
+///
+/// # Upgrade Guide for 0.13.0
+///
+/// Upgrading to object_store 0.13.0 from an earlier version typically involves:
+///
+/// 1. Add a `use` for [`ObjectStoreExt`] to solve the error
+///
+/// ```text
+/// error[E0599]: no method named `put` found for reference `&dyn object_store::ObjectStore` in the current scope
+///    --> datafusion/datasource/src/url.rs:993:14
+/// ```
+///
+/// 2. Remove any (now) redundant implementations (such as `ObjectStore::put`) from any
+///   `ObjectStore` implementations to resolve the error
+///
+/// ```text
+/// error[E0407]: method `put` is not a member of trait `ObjectStore`
+///     --> datafusion/datasource/src/url.rs:1103:9
+///      |
+/// ```
+///
+/// 3. Convert `ObjectStore::delete` to [`ObjectStore::delete_stream`] (see documentation
+///    on that method for details and examples)
+///
+/// 4. Combine `ObjectStore::copy` and `ObjectStore::copy_if_not_exists` implementations into
+///    [`ObjectStore::copy_opts`] (see documentation on that method for details and examples)
+///
+/// 5. Update `object_store::Error::NotImplemented` to include the name of the missing method
+///
+/// For example, change instances of
+/// ```text
+/// object_store::Error::NotImplemented
+/// ```
+/// to
+/// ```
+/// object_store::Error::NotImplemented {
+///    operation: "put".to_string(),
+///    implementer: "RequestCountingObjectStore".to_string(),
+///  };
+/// ```
+///
 #[async_trait]
 pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// Save the provided `payload` to `location` with the given options
@@ -701,6 +924,9 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// The operation is guaranteed to be atomic, it will either successfully
     /// write the entirety of `payload` to `location`, or fail. No clients
     /// should be able to observe a partially written object
+    ///
+    /// To upload large objects without buffering them entirely in memory, use
+    /// the multipart API: [`ObjectStore::put_multipart_opts`]
     async fn put_opts(
         &self,
         location: &Path,
@@ -713,7 +939,13 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// Client should prefer [`ObjectStore::put_opts`] for small payloads, as streaming uploads
     /// typically require multiple separate requests. See [`MultipartUpload`] for more information
     ///
+    /// See also [`BufWriter`](buffered::BufWriter) for an interface that
+    /// automatically picks between a single and multipart upload based on the
+    /// amount of data written.
+    ///
     /// For more advanced multipart uploads see [`MultipartStore`](multipart::MultipartStore)
+    ///
+    /// [`BufWriter`]: buffered::BufWriter
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -853,14 +1085,28 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         .await
     }
 
-    /// Delete the object at the specified location.
-    async fn delete(&self, location: &Path) -> Result<()>;
-
     /// Delete all the objects at the specified locations
     ///
     /// When supported, this method will use bulk operations that delete more
     /// than one object per a request. Otherwise, the implementation may call
     /// the single object delete method for each location.
+    ///
+    /// # Bulk Delete Support
+    ///
+    /// The following backends support native bulk delete operations:
+    ///
+    /// - **AWS (S3)**: Uses the native [DeleteObjects] API with batches of up to 1000 objects
+    /// - **Azure**: Uses the native [Blob Batch] API with batches of up to 256 objects
+    ///
+    /// The following backends use concurrent individual delete operations:
+    ///
+    /// - **GCP**: Performs individual delete requests with up to 10 concurrent operations
+    /// - **HTTP**: Performs individual delete requests with up to 10 concurrent operations
+    /// - **Local**: Performs individual file deletions with up to 10 concurrent operations
+    /// - **Memory**: Performs individual in-memory deletions sequentially
+    ///
+    /// [DeleteObjects]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
+    /// [Blob Batch]: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
     ///
     /// The returned stream yields the results of the delete operations in the
     /// same order as the input locations. However, some errors will be from
@@ -873,14 +1119,14 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// return Ok. If it is an error, it will be [`Error::NotFound`].
     ///
     /// ```ignore-wasm32
-    /// # use futures::{StreamExt, TryStreamExt};
+    /// # use futures_util::{StreamExt, TryStreamExt};
     /// # use object_store::local::LocalFileSystem;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let root = tempfile::TempDir::new().unwrap();
     /// # let store = LocalFileSystem::new_with_prefix(root.path()).unwrap();
     /// # use object_store::{ObjectStore, ObjectStoreExt, ObjectMeta};
     /// # use object_store::path::Path;
-    /// # use futures::{StreamExt, TryStreamExt};
+    /// # use futures_util::{StreamExt, TryStreamExt};
     /// #
     /// // Create two objects
     /// store.put(&Path::from("foo"), "foo".into()).await?;
@@ -906,7 +1152,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     ///
     /// ```
     /// # use async_trait::async_trait;
-    /// # use futures::stream::{BoxStream, StreamExt};
+    /// # use futures_util::stream::{BoxStream, StreamExt};
     /// # use object_store::path::Path;
     /// # use object_store::{
     /// #     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -958,10 +1204,6 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// #         todo!()
     /// #     }
     /// #
-    /// #     async fn delete(&self, _: &Path) -> Result<()> {
-    /// #         todo!()
-    /// #     }
-    /// #
     /// fn delete_stream(
     ///     &self,
     ///     locations: BoxStream<'static, Result<Path>>,
@@ -995,7 +1237,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// #
     /// # async fn example() {
     /// #     let store = ExampleStore { client: Arc::new(ExampleClient) };
-    /// #     let paths = futures::stream::iter(vec![Ok(Path::from("foo")), Ok(Path::from("bar"))]).boxed();
+    /// #     let paths = futures_util::stream::iter(vec![Ok(Path::from("foo")), Ok(Path::from("bar"))]).boxed();
     /// #     let results = store.delete_stream(paths).collect::<Vec<_>>().await;
     /// #     assert_eq!(results.len(), 2);
     /// #     assert_eq!(results[0].as_ref().unwrap(), &Path::from("foo"));
@@ -1023,7 +1265,9 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// List all the objects with the given prefix and a location greater than `offset`
     ///
     /// Some stores, such as S3 and GCS, may be able to push `offset` down to reduce
-    /// the number of network requests required
+    /// the number of network requests required.
+    ///
+    /// This returns an exclusive offset, i.e. objects at exactly `offset` will not be included.
     ///
     /// Note: the order of returned [`ObjectMeta`] is not guaranteed
     ///
@@ -1035,7 +1279,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let offset = offset.clone();
         self.list(prefix)
-            .try_filter(move |f| futures::future::ready(f.location > offset))
+            .try_filter(move |f| futures_util::future::ready(f.location > offset))
             .boxed()
     }
 
@@ -1107,10 +1351,6 @@ macro_rules! as_ref_impl {
                 self.as_ref().get_ranges(location, ranges).await
             }
 
-            async fn delete(&self, location: &Path) -> Result<()> {
-                self.as_ref().delete(location).await
-            }
-
             fn delete_stream(
                 &self,
                 locations: BoxStream<'static, Result<Path>>,
@@ -1155,7 +1395,7 @@ as_ref_impl!(Box<T>);
 
 /// Extension trait for [`ObjectStore`] with convenience functions.
 ///
-/// See the [module-level documentation](crate) for a high leve overview and
+/// See the [module-level documentation](crate) for a high level overview and
 /// examples. See "contract" section within the [`ObjectStore`] documentation
 /// for more reasoning.
 ///
@@ -1167,6 +1407,11 @@ pub trait ObjectStoreExt: ObjectStore {
     /// The operation is guaranteed to be atomic, it will either successfully
     /// write the entirety of `payload` to `location`, or fail. No clients
     /// should be able to observe a partially written object
+    ///
+    /// Note the entire `payload` is buffered in memory. To upload large objects
+    /// without buffering them entirely in memory, use the multipart API:
+    /// [`ObjectStoreExt::put_multipart`], [`WriteMultipart`], or
+    /// [`BufWriter`](buffered::BufWriter)
     fn put(&self, location: &Path, payload: PutPayload) -> impl Future<Output = Result<PutResult>>;
 
     /// Perform a multipart upload
@@ -1250,6 +1495,9 @@ pub trait ObjectStoreExt: ObjectStore {
     /// Return the metadata for the specified location
     fn head(&self, location: &Path) -> impl Future<Output = Result<ObjectMeta>>;
 
+    /// Delete the object at the specified location.
+    fn delete(&self, location: &Path) -> impl Future<Output = Result<()>>;
+
     /// Copy an object from one path to another in the same object store.
     ///
     /// If there exists an object at the destination, it will be overwritten.
@@ -1306,6 +1554,24 @@ where
         Ok(self.get_opts(location, options).await?.meta)
     }
 
+    async fn delete(&self, location: &Path) -> Result<()> {
+        let location = location.clone();
+        let mut stream =
+            self.delete_stream(futures_util::stream::once(async move { Ok(location) }).boxed());
+        let _path = stream.try_next().await?.ok_or_else(|| Error::Generic {
+            store: "ext",
+            source: "`delete_stream` with one location should yield once but didn't".into(),
+        })?;
+        if stream.next().await.is_some() {
+            Err(Error::Generic {
+                store: "ext",
+                source: "`delete_stream` with one location expected to yield exactly once, but yielded more than once".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
         let options = CopyOptions::new().with_mode(CopyMode::Overwrite);
         self.copy_opts(from, to, options).await
@@ -1336,6 +1602,14 @@ pub struct ListResult {
     pub common_prefixes: Vec<Path>,
     /// Object metadata for the listing
     pub objects: Vec<ObjectMeta>,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to return context-specific information (like cache status) from trait methods.
+    ///
+    /// HTTP-backed stores in this crate populate this with the extensions of the HTTP
+    /// response, allowing custom HTTP middleware to propagate information to callers.
+    /// Where a result is assembled from multiple paginated requests, the extensions of
+    /// each response are merged, with those of later responses taking precedence.
+    pub extensions: Extensions,
 }
 
 /// The metadata that describes an object.
@@ -1550,6 +1824,12 @@ pub struct GetResult {
     pub range: Range<u64>,
     /// Additional object attributes
     pub attributes: Attributes,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to return context-specific information (like cache status) from trait methods.
+    ///
+    /// HTTP-backed stores in this crate populate this with the extensions of the HTTP
+    /// response, allowing custom HTTP middleware to propagate information to callers.
+    pub extensions: Extensions,
 }
 
 /// The kind of a [`GetResult`]
@@ -1582,22 +1862,11 @@ impl GetResult {
             #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
             GetResultPayload::File(mut file, path) => {
                 maybe_spawn_blocking(move || {
-                    file.seek(SeekFrom::Start(self.range.start as _))
-                        .map_err(|source| local::Error::Seek {
-                            source,
-                            path: path.clone(),
-                        })?;
+                    use crate::local::read_range;
 
-                    let mut buffer = if let Ok(len) = len.try_into() {
-                        Vec::with_capacity(len)
-                    } else {
-                        Vec::new()
-                    };
-                    file.take(len as _)
-                        .read_to_end(&mut buffer)
-                        .map_err(|source| local::Error::UnableToReadBytes { source, path })?;
+                    let buffer = read_range(&mut file, &path, self.range)?;
 
-                    Ok(buffer.into())
+                    Ok(buffer)
                 })
                 .await
             }
@@ -1756,7 +2025,8 @@ pub struct PutMultipartOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends offered through this crate use extensions installed by methods such as
+    /// `PutMultipartOptions::with_retry_policy`. Other extensions are ignored.
     ///
     /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
@@ -1799,7 +2069,7 @@ impl From<Attributes> for PutMultipartOptions {
 }
 
 /// Result for a put request
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PutResult {
     /// The unique identifier for the newly created object
     ///
@@ -1807,7 +2077,33 @@ pub struct PutResult {
     pub e_tag: Option<String>,
     /// A version indicator for the newly created object
     pub version: Option<String>,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to return context-specific information (like cache status) from trait methods.
+    ///
+    /// HTTP-backed stores in this crate populate this with the extensions of the HTTP
+    /// response, allowing custom HTTP middleware to propagate information to callers.
+    ///
+    /// These extensions are excluded from [`PartialEq`] and [`Eq`].
+    pub extensions: Extensions,
 }
+
+impl PartialEq<Self> for PutResult {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            e_tag,
+            version,
+            extensions: _,
+        } = self;
+        let Self {
+            e_tag: other_e_tag,
+            version: other_version,
+            extensions: _,
+        } = other;
+        (e_tag == other_e_tag) && (version == other_version)
+    }
+}
+
+impl Eq for PutResult {}
 
 /// Configure preconditions for the copy operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1980,6 +2276,7 @@ pub enum Error {
     },
 
     /// Error when `tokio::spawn` failed
+    #[cfg(feature = "tokio")]
     #[error("Error joining spawned task: {}", source)]
     JoinError {
         /// The wrapped error
@@ -2022,8 +2319,17 @@ pub enum Error {
     },
 
     /// Error when an operation is not implemented
-    #[error("Operation not yet implemented.")]
-    NotImplemented,
+    #[error("Operation {operation} not yet implemented by {implementer}.")]
+    NotImplemented {
+        /// What isn't implemented. Should include at least the method
+        /// name that was called; could also include other relevant
+        /// subcontexts.
+        operation: String,
+
+        /// Which driver this is that hasn't implemented this operation,
+        /// to aid debugging in contexts that may be using multiple implementations.
+        implementer: String,
+    },
 
     /// Error when the used credentials don't have enough permission
     /// to perform the requested operation
@@ -2088,6 +2394,27 @@ mod tests {
     }
     pub(crate) use maybe_skip_integration;
 
+    /// Skip a test that asserts the *storage backend* rejects an invalid presigned request
+    /// (tampered signature, expired URL, unmet signed header) unless
+    /// `TEST_S3_SIGNATURE_ENFORCEMENT` is set.
+    ///
+    /// These tests require a backend that actually validates SigV4 — real S3 or MinIO. The
+    /// LocalStack emulator used by the default integration suite does not validate presigned
+    /// signatures or expiry and would return success, so they are gated separately. See
+    /// CONTRIBUTING.md for the MinIO/S3 setup.
+    macro_rules! maybe_skip_signature_enforcement {
+        () => {
+            if std::env::var("TEST_S3_SIGNATURE_ENFORCEMENT").is_err() {
+                eprintln!(
+                    "Skipping signature-enforcement test - set TEST_S3_SIGNATURE_ENFORCEMENT \
+                     and point at a backend that validates SigV4 (real S3 or MinIO)"
+                );
+                return;
+            }
+        };
+    }
+    pub(crate) use maybe_skip_signature_enforcement;
+
     /// Test that the returned stream does not borrow the lifetime of Path
     fn list_store<'a>(
         store: &'a dyn ObjectStore,
@@ -2097,12 +2424,12 @@ mod tests {
         store.list(Some(&path))
     }
 
-    #[cfg(any(feature = "azure", feature = "aws"))]
+    #[cfg(any(feature = "azure-base", feature = "aws-base"))]
     pub(crate) async fn signing<T>(integration: &T)
     where
         T: ObjectStore + signer::Signer,
     {
-        use reqwest::Method;
+        use ::http::Method;
         use std::time::Duration;
 
         let data = Bytes::from("hello world");
@@ -2120,7 +2447,7 @@ mod tests {
         assert_eq!(data, loaded);
     }
 
-    #[cfg(any(feature = "aws", feature = "azure"))]
+    #[cfg(any(feature = "aws-base", feature = "azure-base"))]
     pub(crate) async fn tagging<F, Fut>(storage: Arc<dyn ObjectStore>, validate: bool, get_tags: F)
     where
         F: Fn(Path) -> Fut + Send + Sync,
@@ -2214,7 +2541,7 @@ mod tests {
             location: Path::from("test"),
             last_modified: Utc.timestamp_nanos(100),
             size: 100,
-            e_tag: Some("123".to_string()),
+            e_tag: Some("\"123\"".to_string()),
             version: None,
         };
 
@@ -2243,16 +2570,16 @@ mod tests {
 
         options = GetOptions::default();
 
-        options.if_match = Some("123".to_string());
+        options.if_match = Some("\"123\"".to_string());
         options.check_preconditions(&meta).unwrap();
 
-        options.if_match = Some("123,354".to_string());
+        options.if_match = Some("\"123\",\"354\"".to_string());
         options.check_preconditions(&meta).unwrap();
 
-        options.if_match = Some("354, 123,".to_string());
+        options.if_match = Some("\"354\", \"123\"".to_string());
         options.check_preconditions(&meta).unwrap();
 
-        options.if_match = Some("354".to_string());
+        options.if_match = Some("\"354\"".to_string());
         options.check_preconditions(&meta).unwrap_err();
 
         options.if_match = Some("*".to_string());
@@ -2264,16 +2591,16 @@ mod tests {
 
         options = GetOptions::default();
 
-        options.if_none_match = Some("123".to_string());
+        options.if_none_match = Some("\"123\"".to_string());
         options.check_preconditions(&meta).unwrap_err();
 
         options.if_none_match = Some("*".to_string());
         options.check_preconditions(&meta).unwrap_err();
 
-        options.if_none_match = Some("1232".to_string());
+        options.if_none_match = Some("\"1232\"".to_string());
         options.check_preconditions(&meta).unwrap();
 
-        options.if_none_match = Some("23, 123".to_string());
+        options.if_none_match = Some("\"23\", \"123\"".to_string());
         options.check_preconditions(&meta).unwrap_err();
 
         // If-None-Match takes precedence
@@ -2293,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "http")]
+    #[cfg(feature = "http-base")]
     fn test_reexported_types() {
         // Test HeaderMap
         let mut headers = HeaderMap::new();

@@ -24,14 +24,14 @@ use crate::aws::{
     AmazonS3, AwsCredential, AwsCredentialProvider, Checksum, S3ConditionalPut, S3CopyIfNotExists,
     STORE,
 };
-use crate::client::{HttpConnector, TokenCredentialProvider, http_connector};
+use crate::client::{CryptoProvider, HttpConnector, TokenCredentialProvider, http_connector};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use http::header::{HeaderMap, HeaderValue};
 use itertools::Itertools;
 use md5::{Digest, Md5};
-use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -41,6 +41,10 @@ use url::Url;
 
 /// Default metadata endpoint
 static DEFAULT_METADATA_ENDPOINT: &str = "http://169.254.169.254";
+
+/// AWS S3 does not support copy operations larger than 5 GiB in a single request. See [Copy
+/// Object](https://docs.aws.amazon.com/AmazonS3/latest/userguide/copy-object.html) for reference.
+const MAX_SINGLE_REQUEST_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +139,8 @@ pub struct AmazonS3Builder {
     bucket_name: Option<String>,
     /// Endpoint for communicating with AWS S3
     endpoint: Option<String>,
+    /// Service-specific S3 endpoint URL (takes precedence over endpoint)
+    s3_endpoint: Option<String>,
     /// Token to use for requests
     token: Option<String>,
     /// Url
@@ -171,6 +177,8 @@ pub struct AmazonS3Builder {
     client_options: ClientOptions,
     /// Credentials
     credentials: Option<AwsCredentialProvider>,
+    /// The [`CryptoProvider`] to use
+    crypto: Option<Arc<dyn CryptoProvider>>,
     /// Skip signing requests
     skip_signature: ConfigValue<bool>,
     /// Copy if not exists
@@ -179,6 +187,8 @@ pub struct AmazonS3Builder {
     conditional_put: ConfigValue<S3ConditionalPut>,
     /// Ignore tags
     disable_tagging: ConfigValue<bool>,
+    /// Disable bulk delete
+    disable_bulk_delete: ConfigValue<bool>,
     /// Encryption (See [`S3EncryptionConfigKey`])
     encryption_type: Option<ConfigValue<S3EncryptionType>>,
     encryption_kms_key_id: Option<String>,
@@ -186,9 +196,13 @@ pub struct AmazonS3Builder {
     /// base64-encoded 256-bit customer encryption key for SSE-C.
     encryption_customer_key_base64: Option<String>,
     /// When set to true, charge requester for bucket operations
-    request_payer: ConfigValue<bool>,
+    request_payer: ConfigValue<RequesterPayer>,
     /// The [`HttpConnector`] to use
     http_connector: Option<Arc<dyn HttpConnector>>,
+    /// Threshold (bytes) above which copy uses multipart copy. If not set, defaults to 5 GiB.
+    multipart_copy_threshold: Option<ConfigValue<u64>>,
+    /// Preferred multipart copy part size (bytes). If not set, defaults to 5 GiB.
+    multipart_copy_part_size: Option<ConfigValue<u64>>,
 }
 
 /// Configuration keys for [`AmazonS3Builder`]
@@ -263,6 +277,14 @@ pub enum AmazonS3ConfigKey {
     /// - `endpoint_url`
     Endpoint,
 
+    /// Service-specific S3 endpoint URL
+    ///
+    /// When set, takes precedence over [`Endpoint`](Self::Endpoint) in the build method.
+    ///
+    /// Supported keys:
+    /// - `aws_endpoint_url_s3`
+    S3Endpoint,
+
     /// Token to use for requests (passed to underlying provider)
     ///
     /// See [`AmazonS3Builder::with_token`] for details.
@@ -303,7 +325,7 @@ pub enum AmazonS3ConfigKey {
 
     /// Set the checksum algorithm for this client
     ///
-    /// See [`AmazonS3Builder::with_checksum_algorithm`]
+    /// See [`AmazonS3Builder::with_checksum_algorithm`] for details.
     Checksum,
 
     /// Set the instance metadata endpoint
@@ -322,6 +344,8 @@ pub enum AmazonS3ConfigKey {
     /// Supported keys:
     /// - `aws_container_credentials_relative_uri`
     /// - `container_credentials_relative_uri`
+    ///
+    /// Example: `/v2/credentials/abc123`
     ContainerCredentialsRelativeUri,
 
     /// Set the container credentials full URI when used in EKS
@@ -331,6 +355,8 @@ pub enum AmazonS3ConfigKey {
     /// Supported keys:
     /// - `aws_container_credentials_full_uri`
     /// - `container_credentials_full_uri`
+    ///
+    /// Example: `http://169.254.170.2/v2/credentials/abc123`
     ContainerCredentialsFullUri,
 
     /// Set the authorization token in plain text when used in EKS to authenticate with ContainerCredentialsFullUri
@@ -340,6 +366,8 @@ pub enum AmazonS3ConfigKey {
     /// Supported keys:
     /// - `aws_container_authorization_token_file`
     /// - `container_authorization_token_file`
+    ///
+    /// Example: `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`
     ContainerAuthorizationTokenFile,
 
     /// Web identity token file path for AssumeRoleWithWebIdentity
@@ -347,6 +375,8 @@ pub enum AmazonS3ConfigKey {
     /// Supported keys:
     /// - `aws_web_identity_token_file`
     /// - `web_identity_token_file`
+    ///
+    /// Example: `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`
     WebIdentityTokenFile,
 
     /// Role ARN to assume when using web identity token
@@ -354,6 +384,8 @@ pub enum AmazonS3ConfigKey {
     /// Supported keys:
     /// - `aws_role_arn`
     /// - `role_arn`
+    ///
+    /// Example: `arn:aws:iam::123456789012:role/MyWebIdentityRole`
     RoleArn,
 
     /// Session name for web identity role assumption
@@ -365,6 +397,8 @@ pub enum AmazonS3ConfigKey {
 
     /// Custom STS endpoint for web identity token exchange
     ///
+    /// Defaults to `https://sts.{region}.amazonaws.com`
+    ///
     /// Supported keys:
     /// - `aws_endpoint_url_sts`
     /// - `endpoint_url_sts`
@@ -372,7 +406,7 @@ pub enum AmazonS3ConfigKey {
 
     /// Configure how to provide `copy_if_not_exists`
     ///
-    /// See [`S3CopyIfNotExists`]
+    /// See [`S3CopyIfNotExists`] for details.
     ///
     /// Supported keys:
     /// - `aws_copy_if_not_exists`
@@ -381,7 +415,7 @@ pub enum AmazonS3ConfigKey {
 
     /// Configure how to provide conditional put operations
     ///
-    /// See [`S3ConditionalPut`]
+    /// See [`S3ConditionalPut`] for details.
     ///
     /// Supported keys:
     /// - `aws_conditional_put`
@@ -390,6 +424,8 @@ pub enum AmazonS3ConfigKey {
 
     /// Skip signing request
     ///
+    /// See [`AmazonS3Builder::with_skip_signature`] for details.
+    ///
     /// Supported keys:
     /// - `aws_skip_signature`
     /// - `skip_signature`
@@ -397,12 +433,26 @@ pub enum AmazonS3ConfigKey {
 
     /// Disable tagging objects
     ///
+    /// If set to `true` will ignore any tags provided to [`put_opts`](crate::ObjectStore::put_opts).
     /// This can be desirable if not supported by the backing store
     ///
     /// Supported keys:
     /// - `aws_disable_tagging`
     /// - `disable_tagging`
     DisableTagging,
+
+    /// Disable bulk delete (`DeleteObjects`, `POST /?delete`)
+    ///
+    /// If set to `true`, [`delete`](crate::ObjectStoreExt::delete) and
+    /// [`delete_stream`](crate::ObjectStore::delete_stream) will issue
+    /// single-object `DELETE /key` requests instead of the bulk `DeleteObjects`
+    /// API (`POST /?delete`). Use this for S3-compatible providers that do not
+    /// implement `DeleteObjects` (e.g. Alibaba Cloud OSS).
+    ///
+    /// Supported keys:
+    /// - `aws_disable_bulk_delete`
+    /// - `disable_bulk_delete`
+    DisableBulkDelete,
 
     /// Enable Support for S3 Express One Zone
     ///
@@ -423,6 +473,10 @@ pub enum AmazonS3ConfigKey {
 
     /// Encryption options
     Encryption(S3EncryptionConfigKey),
+    /// Threshold (bytes) to switch to multipart copy
+    MultipartCopyThreshold,
+    /// Preferred multipart copy part size (bytes)
+    MultipartCopyPartSize,
 }
 
 impl AsRef<str> for AmazonS3ConfigKey {
@@ -433,6 +487,7 @@ impl AsRef<str> for AmazonS3ConfigKey {
             Self::Region => "aws_region",
             Self::Bucket => "aws_bucket",
             Self::Endpoint => "aws_endpoint",
+            Self::S3Endpoint => "aws_endpoint_url_s3",
             Self::Token => "aws_session_token",
             Self::ImdsV1Fallback => "aws_imdsv1_fallback",
             Self::VirtualHostedStyleRequest => "aws_virtual_hosted_style_request",
@@ -452,9 +507,12 @@ impl AsRef<str> for AmazonS3ConfigKey {
             Self::CopyIfNotExists => "aws_copy_if_not_exists",
             Self::ConditionalPut => "aws_conditional_put",
             Self::DisableTagging => "aws_disable_tagging",
+            Self::DisableBulkDelete => "aws_disable_bulk_delete",
             Self::RequestPayer => "aws_request_payer",
             Self::Client(opt) => opt.as_ref(),
             Self::Encryption(opt) => opt.as_ref(),
+            Self::MultipartCopyThreshold => "aws_multipart_copy_threshold",
+            Self::MultipartCopyPartSize => "aws_multipart_copy_part_size",
         }
     }
 }
@@ -470,6 +528,7 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_region" | "region" => Ok(Self::Region),
             "aws_bucket" | "aws_bucket_name" | "bucket_name" | "bucket" => Ok(Self::Bucket),
             "aws_endpoint_url" | "aws_endpoint" | "endpoint_url" | "endpoint" => Ok(Self::Endpoint),
+            "aws_endpoint_url_s3" => Ok(Self::S3Endpoint),
             "aws_session_token" | "aws_token" | "session_token" | "token" => Ok(Self::Token),
             "aws_virtual_hosted_style_request" | "virtual_hosted_style_request" => {
                 Ok(Self::VirtualHostedStyleRequest)
@@ -498,7 +557,14 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_copy_if_not_exists" | "copy_if_not_exists" => Ok(Self::CopyIfNotExists),
             "aws_conditional_put" | "conditional_put" => Ok(Self::ConditionalPut),
             "aws_disable_tagging" | "disable_tagging" => Ok(Self::DisableTagging),
+            "aws_disable_bulk_delete" | "disable_bulk_delete" => Ok(Self::DisableBulkDelete),
             "aws_request_payer" | "request_payer" => Ok(Self::RequestPayer),
+            "aws_multipart_copy_threshold" | "multipart_copy_threshold" => {
+                Ok(Self::MultipartCopyThreshold)
+            }
+            "aws_multipart_copy_part_size" | "multipart_copy_part_size" => {
+                Ok(Self::MultipartCopyPartSize)
+            }
             // Backwards compatibility
             "aws_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
             "aws_server_side_encryption" | "server_side_encryption" => Ok(Self::Encryption(
@@ -529,15 +595,15 @@ impl AmazonS3Builder {
 
     /// Fill the [`AmazonS3Builder`] with regular AWS environment variables
     ///
-    /// All environment variables starting with `AWS_` will be evaluated. Names must
-    /// match acceptable input to [`AmazonS3ConfigKey::from_str`]. Only upper-case environment
-    /// variables are accepted.
+    /// All environment variables starting with `AWS_` will be evaluated.
+    /// Names must match acceptable input to [`AmazonS3ConfigKey::from_str`].
     ///
     /// Some examples of variables extracted from environment:
     /// * `AWS_ACCESS_KEY_ID` -> access_key_id
     /// * `AWS_SECRET_ACCESS_KEY` -> secret_access_key
     /// * `AWS_DEFAULT_REGION` -> region
     /// * `AWS_ENDPOINT` -> endpoint
+    /// * `AWS_ENDPOINT_URL_S3` -> s3_endpoint (takes precedence over endpoint in build)
     /// * `AWS_SESSION_TOKEN` -> token
     /// * `AWS_WEB_IDENTITY_TOKEN_FILE` -> path to file containing web identity token for AssumeRoleWithWebIdentity
     /// * `AWS_ROLE_ARN` -> ARN of the role to assume when using web identity token
@@ -547,7 +613,8 @@ impl AmazonS3Builder {
     /// * `AWS_CONTAINER_CREDENTIALS_FULL_URI` -> <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
     /// * `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` -> <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
     /// * `AWS_ALLOW_HTTP` -> set to "true" to permit HTTP connections without TLS
-    /// * `AWS_REQUEST_PAYER` -> set to "true" to permit operations on requester-pays buckets.
+    /// * `AWS_REQUEST_PAYER` -> set to "requester" or "true" to permit operations on requester-pays buckets.
+    ///
     /// # Example
     /// ```
     /// use object_store::aws::AmazonS3Builder;
@@ -558,7 +625,6 @@ impl AmazonS3Builder {
     /// ```
     pub fn from_env() -> Self {
         let mut builder: Self = Default::default();
-
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
                 if key.starts_with("AWS_") {
@@ -568,7 +634,6 @@ impl AmazonS3Builder {
                 }
             }
         }
-
         builder
     }
 
@@ -580,7 +645,10 @@ impl AmazonS3Builder {
     /// - `s3a://<bucket>/<path>`
     /// - `https://s3.<region>.amazonaws.com/<bucket>`
     /// - `https://<bucket>.s3.<region>.amazonaws.com`
+    /// - `https://s3.dualstack.<region>.amazonaws.com/<bucket>`
+    /// - `https://<bucket>.s3.dualstack.<region>.amazonaws.com`
     /// - `https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket`
+    /// - `https://ACCOUNT_ID.JURISDICTION.r2.cloudflarestorage.com/bucket`
     ///
     /// Note: Settings derived from the URL will override any others set on this builder
     ///
@@ -605,6 +673,7 @@ impl AmazonS3Builder {
             AmazonS3ConfigKey::Region => self.region = Some(value.into()),
             AmazonS3ConfigKey::Bucket => self.bucket_name = Some(value.into()),
             AmazonS3ConfigKey::Endpoint => self.endpoint = Some(value.into()),
+            AmazonS3ConfigKey::S3Endpoint => self.s3_endpoint = Some(value.into()),
             AmazonS3ConfigKey::Token => self.token = Some(value.into()),
             AmazonS3ConfigKey::ImdsV1Fallback => self.imdsv1_fallback.parse(value),
             AmazonS3ConfigKey::VirtualHostedStyleRequest => {
@@ -645,15 +714,14 @@ impl AmazonS3Builder {
             }
             AmazonS3ConfigKey::SkipSignature => self.skip_signature.parse(value),
             AmazonS3ConfigKey::DisableTagging => self.disable_tagging.parse(value),
+            AmazonS3ConfigKey::DisableBulkDelete => self.disable_bulk_delete.parse(value),
             AmazonS3ConfigKey::CopyIfNotExists => {
                 self.copy_if_not_exists = Some(ConfigValue::Deferred(value.into()))
             }
             AmazonS3ConfigKey::ConditionalPut => {
                 self.conditional_put = ConfigValue::Deferred(value.into())
             }
-            AmazonS3ConfigKey::RequestPayer => {
-                self.request_payer = ConfigValue::Deferred(value.into())
-            }
+            AmazonS3ConfigKey::RequestPayer => self.request_payer.parse(value),
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
                     self.encryption_type = Some(ConfigValue::Deferred(value.into()))
@@ -666,6 +734,12 @@ impl AmazonS3Builder {
                     self.encryption_customer_key_base64 = Some(value.into())
                 }
             },
+            AmazonS3ConfigKey::MultipartCopyThreshold => {
+                self.multipart_copy_threshold = Some(ConfigValue::Deferred(value.into()))
+            }
+            AmazonS3ConfigKey::MultipartCopyPartSize => {
+                self.multipart_copy_part_size = Some(ConfigValue::Deferred(value.into()))
+            }
         };
         self
     }
@@ -688,6 +762,7 @@ impl AmazonS3Builder {
             AmazonS3ConfigKey::Region | AmazonS3ConfigKey::DefaultRegion => self.region.clone(),
             AmazonS3ConfigKey::Bucket => self.bucket_name.clone(),
             AmazonS3ConfigKey::Endpoint => self.endpoint.clone(),
+            AmazonS3ConfigKey::S3Endpoint => self.s3_endpoint.clone(),
             AmazonS3ConfigKey::Token => self.token.clone(),
             AmazonS3ConfigKey::ImdsV1Fallback => Some(self.imdsv1_fallback.to_string()),
             AmazonS3ConfigKey::VirtualHostedStyleRequest => {
@@ -719,6 +794,7 @@ impl AmazonS3Builder {
             }
             AmazonS3ConfigKey::ConditionalPut => Some(self.conditional_put.to_string()),
             AmazonS3ConfigKey::DisableTagging => Some(self.disable_tagging.to_string()),
+            AmazonS3ConfigKey::DisableBulkDelete => Some(self.disable_bulk_delete.to_string()),
             AmazonS3ConfigKey::RequestPayer => Some(self.request_payer.to_string()),
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
@@ -733,6 +809,14 @@ impl AmazonS3Builder {
                     self.encryption_customer_key_base64.clone()
                 }
             },
+            AmazonS3ConfigKey::MultipartCopyThreshold => self
+                .multipart_copy_threshold
+                .as_ref()
+                .map(|x| x.to_string()),
+            AmazonS3ConfigKey::MultipartCopyPartSize => self
+                .multipart_copy_part_size
+                .as_ref()
+                .map(|x| x.to_string()),
         }
     }
 
@@ -760,8 +844,32 @@ impl AmazonS3Builder {
                         self.bucket_name = Some(bucket.into());
                     }
                 }
+                // Path-style dual-stack endpoint, e.g. `s3.dualstack.<region>.amazonaws.com`.
+                Some(("s3", "dualstack", region, "amazonaws.com")) => {
+                    self.region = Some(region.to_string());
+                    // Override endpoint to explicitly preserve dualstack address
+                    self.endpoint = Some(format!("https://s3.dualstack.{region}.amazonaws.com"));
+                    let bucket = parsed.path_segments().into_iter().flatten().next();
+                    if let Some(bucket) = bucket {
+                        self.bucket_name = Some(bucket.into());
+                    }
+                }
                 Some((bucket, "s3", "amazonaws", "com")) => {
                     self.bucket_name = Some(bucket.to_string());
+                    self.virtual_hosted_style_request = true.into();
+                }
+                // Virtual-hosted dual-stack endpoint, e.g.
+                // `<bucket>.s3.dualstack.<region>.amazonaws.com`
+                Some((bucket, "s3", "dualstack", rest)) => {
+                    let region = rest
+                        .strip_suffix(".amazonaws.com")
+                        .ok_or_else(|| Error::UrlNotRecognised { url: url.into() })?;
+                    self.bucket_name = Some(bucket.to_string());
+                    self.region = Some(region.to_string());
+                    // Override endpoint to explicitly preserve dualstack address
+                    self.endpoint = Some(format!(
+                        "https://{bucket}.s3.dualstack.{region}.amazonaws.com"
+                    ));
                     self.virtual_hosted_style_request = true.into();
                 }
                 Some((bucket, "s3", region, "amazonaws.com")) => {
@@ -772,6 +880,17 @@ impl AmazonS3Builder {
                 Some((account, "r2", "cloudflarestorage", "com")) => {
                     self.region = Some("auto".to_string());
                     let endpoint = format!("https://{account}.r2.cloudflarestorage.com");
+                    self.endpoint = Some(endpoint);
+
+                    let bucket = parsed.path_segments().into_iter().flatten().next();
+                    if let Some(bucket) = bucket {
+                        self.bucket_name = Some(bucket.into());
+                    }
+                }
+                Some((account, jurisdiction, "r2", "cloudflarestorage.com")) => {
+                    self.region = Some("auto".to_string());
+                    let endpoint =
+                        format!("https://{account}.{jurisdiction}.r2.cloudflarestorage.com");
                     self.endpoint = Some(endpoint);
 
                     let bucket = parsed.path_segments().into_iter().flatten().next();
@@ -790,6 +909,8 @@ impl AmazonS3Builder {
     }
 
     /// Set the AWS Access Key
+    ///
+    /// Examples: `AKIAIOSFODNN7EXAMPLE`, `ASIA4ZP5EXAMPLETOKEN`
     pub fn with_access_key_id(mut self, access_key_id: impl Into<String>) -> Self {
         self.access_key_id = Some(access_key_id.into());
         self
@@ -802,6 +923,8 @@ impl AmazonS3Builder {
     }
 
     /// Set the AWS Session Token to use for requests
+    ///
+    /// Should not be used in combination with [`Self::with_allow_http`].
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
@@ -819,17 +942,19 @@ impl AmazonS3Builder {
         self
     }
 
-    /// Sets the endpoint for communicating with AWS S3, defaults to the [region endpoint]
+    /// Sets the endpoint for communicating with AWS S3.
+    ///
+    /// Defaults to the [region endpoint]. See  [`Self::with_region`] for further details.
     ///
     /// For example, this might be set to `"http://localhost:4566:`
     /// for testing against a localstack instance.
     ///
-    /// The `endpoint` field should be consistent with [`Self::with_virtual_hosted_style_request`],
-    /// i.e. if `virtual_hosted_style_request` is set to true then `endpoint`
+    /// The `endpoint` field should be consistent with [`Self::with_virtual_hosted_style_request`].
+    /// I.e. if `virtual_hosted_style_request` is set to true then `endpoint`
     /// should have the bucket name included.
     ///
-    /// By default, only HTTPS schemes are enabled. To connect to an HTTP endpoint, enable
-    /// [`Self::with_allow_http`].
+    /// By default, only HTTPS schemes are enabled.
+    /// To connect to an HTTP endpoint, enable [`Self::with_allow_http`].
     ///
     /// [region endpoint]: https://docs.aws.amazon.com/general/latest/gr/s3.html
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -843,9 +968,25 @@ impl AmazonS3Builder {
         self
     }
 
-    /// Sets what protocol is allowed. If `allow_http` is :
+    /// The [`CryptoProvider`] to use
+    pub fn with_crypto_provider(mut self, provider: Arc<dyn CryptoProvider>) -> Self {
+        self.crypto = Some(provider);
+        self
+    }
+
+    /// Sets what protocol is allowed.
+    ///
+    /// If `allow_http` is :
     /// * false (default):  Only HTTPS are allowed
     /// * true:  HTTP and HTTPS are allowed
+    ///
+    /// <div class="warning">
+    ///
+    /// **Warning**
+    ///
+    /// If you enable this option, attackers may be able to read the data you request.
+    ///
+    /// </div>
     pub fn with_allow_http(mut self, allow_http: bool) -> Self {
         self.client_options = self.client_options.with_allow_http(allow_http);
         self
@@ -859,7 +1000,7 @@ impl AmazonS3Builder {
     ///
     /// If the `endpoint` is provided then it should be
     /// consistent with `virtual_hosted_style_request`.
-    /// i.e. if `virtual_hosted_style_request` is set to true
+    /// I.e. if `virtual_hosted_style_request` is set to true
     /// then `endpoint` should have bucket name included.
     pub fn with_virtual_hosted_style_request(mut self, virtual_hosted_style_request: bool) -> Self {
         self.virtual_hosted_style_request = virtual_hosted_style_request.into();
@@ -889,13 +1030,13 @@ impl AmazonS3Builder {
     ///
     /// [IMDSv2]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html
     /// [SSRF attack]: https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-ssrf-vulnerabilities-ec2-instance-metadata-service/
-    ///
     pub fn with_imdsv1_fallback(mut self) -> Self {
         self.imdsv1_fallback = true.into();
         self
     }
 
     /// Sets if unsigned payload option has to be used.
+    ///
     /// See [unsigned payload option](https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html)
     /// * false (default): Signed payload option is used, where the checksum for the request body is computed and included when constructing a canonical request.
     /// * true: Unsigned payload option is used. `UNSIGNED-PAYLOAD` literal is included when constructing a canonical request,
@@ -924,8 +1065,8 @@ impl AmazonS3Builder {
     /// Set the [instance metadata endpoint](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html),
     /// used primarily within AWS EC2.
     ///
-    /// This defaults to the IPv4 endpoint: http://169.254.169.254. One can alternatively use the IPv6
-    /// endpoint http://fd00:ec2::254.
+    /// This defaults to the IPv4 endpoint: http://169.254.169.254.
+    /// One can alternatively use the IPv6 endpoint http://fd00:ec2::254.
     pub fn with_metadata_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.metadata_endpoint = Some(endpoint.into());
         self
@@ -970,9 +1111,24 @@ impl AmazonS3Builder {
         self
     }
 
-    /// If set to `true` will ignore any tags provided to put_opts
+    /// If set to `true` will ignore any tags provided to [`put_opts`](crate::ObjectStore::put_opts)
     pub fn with_disable_tagging(mut self, ignore: bool) -> Self {
         self.disable_tagging = ignore.into();
+        self
+    }
+
+    /// If set to `true`, [`delete`](crate::ObjectStoreExt::delete) and
+    /// [`delete_stream`](crate::ObjectStore::delete_stream) will issue
+    /// single-object `DELETE /key` requests instead of the bulk `DeleteObjects`
+    /// API (`POST /?delete`).
+    ///
+    /// The bulk `DeleteObjects` API is more efficient but is not implemented by
+    /// all S3-compatible providers (e.g. Alibaba Cloud OSS). Setting this to
+    /// `true` restores the single-object delete behaviour that works against
+    /// every S3-compatible provider, at the cost of throughput when deleting
+    /// many objects via [`delete_stream`](crate::ObjectStore::delete_stream).
+    pub fn with_disable_bulk_delete(mut self, disable: bool) -> Self {
+        self.disable_bulk_delete = disable.into();
         self
     }
 
@@ -1017,7 +1173,7 @@ impl AmazonS3Builder {
     ///
     /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/RequesterPaysBuckets.html>
     pub fn with_request_payer(mut self, enabled: bool) -> Self {
-        self.request_payer = ConfigValue::Parsed(enabled);
+        self.request_payer = ConfigValue::Parsed(enabled.into());
         self
     }
 
@@ -1026,6 +1182,18 @@ impl AmazonS3Builder {
     /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
     pub fn with_http_connector<C: HttpConnector>(mut self, connector: C) -> Self {
         self.http_connector = Some(Arc::new(connector));
+        self
+    }
+
+    /// Set threshold (bytes) above which copy uses multipart copy
+    pub fn with_multipart_copy_threshold(mut self, threshold_bytes: u64) -> Self {
+        self.multipart_copy_threshold = Some(ConfigValue::Parsed(threshold_bytes));
+        self
+    }
+
+    /// Set preferred multipart copy part size (bytes)
+    pub fn with_multipart_copy_part_size(mut self, part_size_bytes: u64) -> Self {
+        self.multipart_copy_part_size = Some(ConfigValue::Parsed(part_size_bytes));
         self
     }
 
@@ -1150,6 +1318,7 @@ impl AmazonS3Builder {
                             endpoint: endpoint.clone(),
                             region: region.clone(),
                             credentials: Arc::clone(&credentials),
+                            crypto: self.crypto.clone(),
                         },
                         http.connect(&self.client_options)?,
                         self.retry_config.clone(),
@@ -1161,10 +1330,13 @@ impl AmazonS3Builder {
             false => (None, None),
         };
 
+        // S3-specific endpoint takes precedence over generic endpoint
+        let endpoint = self.s3_endpoint.or(self.endpoint);
+
         // If `endpoint` is provided it's assumed to be consistent with `virtual_hosted_style_request` or `s3_express`.
         // For example, if `virtual_hosted_style_request` is true then `endpoint` should have bucket name included.
         let virtual_hosted = self.virtual_hosted_style_request.get()?;
-        let bucket_endpoint = match (&self.endpoint, zonal_endpoint, virtual_hosted) {
+        let bucket_endpoint = match (&endpoint, zonal_endpoint, virtual_hosted) {
             (Some(endpoint), _, true) => endpoint.clone(),
             (Some(endpoint), _, false) => format!("{}/{}", endpoint.trim_end_matches("/"), bucket),
             (None, Some(endpoint), _) => endpoint,
@@ -1185,22 +1357,37 @@ impl AmazonS3Builder {
             S3EncryptionHeaders::default()
         };
 
+        let multipart_copy_threshold = self
+            .multipart_copy_threshold
+            .map(|val| val.get())
+            .transpose()?
+            .unwrap_or(MAX_SINGLE_REQUEST_COPY_SIZE);
+        let multipart_copy_part_size = self
+            .multipart_copy_part_size
+            .map(|val| val.get())
+            .transpose()?
+            .unwrap_or(MAX_SINGLE_REQUEST_COPY_SIZE);
+
         let config = S3Config {
             region,
             bucket,
             bucket_endpoint,
             credentials,
+            crypto: self.crypto,
             session_provider,
             retry_config: self.retry_config,
             client_options: self.client_options,
             sign_payload: !self.unsigned_payload.get()?,
             skip_signature: self.skip_signature.get()?,
             disable_tagging: self.disable_tagging.get()?,
+            disable_bulk_delete: self.disable_bulk_delete.get()?,
             checksum,
             copy_if_not_exists,
             conditional_put: self.conditional_put.get()?,
             encryption_headers,
-            request_payer: self.request_payer.get()?,
+            request_payer: self.request_payer.get()?.into(),
+            multipart_copy_threshold,
+            multipart_copy_part_size,
         };
 
         let http_client = http.connect(&config.client_options)?;
@@ -1214,7 +1401,44 @@ impl AmazonS3Builder {
 ///
 /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-bucket-naming-rules.html>
 fn parse_bucket_az(bucket: &str) -> Option<&str> {
-    Some(bucket.strip_suffix("--x-s3")?.rsplit_once("--")?.1)
+    let base = bucket
+        .strip_suffix("--x-s3")
+        .or_else(|| bucket.strip_suffix("--xa-s3"))?;
+    Some(base.rsplit_once("--")?.1)
+}
+
+/// Captures `AWS_REQUEST_PAYER`.
+///
+/// Parses either as `"requester"` (case-insensitive) meaning `true`, or as a [`bool`] (i.e. `"true"`, `"1"`, `"no"`, etc.).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+struct RequesterPayer(bool);
+
+impl crate::config::Parse for RequesterPayer {
+    fn parse(v: &str) -> Result<Self> {
+        if v.eq_ignore_ascii_case("requester") {
+            Ok(Self(true))
+        } else {
+            Ok(Self(<bool as crate::config::Parse>::parse(v)?))
+        }
+    }
+}
+
+impl From<bool> for RequesterPayer {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
+
+impl From<RequesterPayer> for bool {
+    fn from(value: RequesterPayer) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for RequesterPayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// Encryption configuration options for S3.
@@ -1248,6 +1472,8 @@ pub enum S3EncryptionConfigKey {
     /// Supported keys:
     /// - `aws_sse_kms_key_id`
     /// - `sse_kms_key_id`
+    ///
+    /// Example: `arn:aws:kms:us-east-1:123456789012:key/abcd-1234-efgh-5678`
     KmsKeyId,
     /// If set to true, will use the bucket's default KMS key for server-side encryption.
     /// If set to false, will disable the use of the bucket's default KMS key for server-side encryption.
@@ -1454,6 +1680,38 @@ mod tests {
         assert!(builder.unsigned_payload.get().unwrap());
     }
 
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn s3_test_endpoint_url_s3_config() {
+        // Verify aws_endpoint_url_s3 parses to S3Endpoint config key
+        let key: AmazonS3ConfigKey = "aws_endpoint_url_s3".parse().unwrap();
+        assert!(matches!(key, AmazonS3ConfigKey::S3Endpoint));
+
+        // Verify S3Endpoint takes precedence over Endpoint in build, regardless of order
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::Endpoint, "http://generic-endpoint")
+            .with_config(AmazonS3ConfigKey::S3Endpoint, "http://s3-specific-endpoint")
+            .with_bucket_name("test-bucket")
+            .build()
+            .unwrap();
+        assert_eq!(
+            s3.client.config.bucket_endpoint,
+            "http://s3-specific-endpoint/test-bucket"
+        );
+
+        // Verify precedence works even when S3Endpoint is set first
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::S3Endpoint, "http://s3-specific-endpoint")
+            .with_config(AmazonS3ConfigKey::Endpoint, "http://generic-endpoint")
+            .with_bucket_name("test-bucket")
+            .build()
+            .unwrap();
+        assert_eq!(
+            s3.client.config.bucket_endpoint,
+            "http://s3-specific-endpoint/test-bucket"
+        );
+    }
+
     #[test]
     fn s3_test_config_get_value() {
         let aws_access_key_id = "object_store:fake_access_key_id".to_string();
@@ -1537,6 +1795,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn s3_default_region() {
         let builder = AmazonS3Builder::new()
@@ -1546,6 +1805,7 @@ mod tests {
         assert_eq!(builder.client.config.region, "us-east-1");
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn s3_test_bucket_endpoint() {
         let builder = AmazonS3Builder::new()
@@ -1619,6 +1879,32 @@ mod tests {
         assert_eq!(builder.region, Some("region".to_string()));
         assert!(builder.virtual_hosted_style_request.get().unwrap());
 
+        // Path-style dual-stack endpoint
+        let mut builder = AmazonS3Builder::new();
+        builder
+            .parse_url("https://s3.dualstack.us-east-1.amazonaws.com/bucket/path")
+            .unwrap();
+        assert_eq!(builder.region, Some("us-east-1".to_string()));
+        assert_eq!(builder.bucket_name, Some("bucket".to_string()));
+        assert_eq!(
+            builder.endpoint,
+            Some("https://s3.dualstack.us-east-1.amazonaws.com".to_string())
+        );
+        assert!(!builder.virtual_hosted_style_request.get().unwrap());
+
+        // Virtual-hosted dual-stack endpoint
+        let mut builder = AmazonS3Builder::new();
+        builder
+            .parse_url("https://bucket.s3.dualstack.us-east-1.amazonaws.com")
+            .unwrap();
+        assert_eq!(builder.bucket_name, Some("bucket".to_string()));
+        assert_eq!(builder.region, Some("us-east-1".to_string()));
+        assert_eq!(
+            builder.endpoint,
+            Some("https://bucket.s3.dualstack.us-east-1.amazonaws.com".to_string())
+        );
+        assert!(builder.virtual_hosted_style_request.get().unwrap());
+
         let mut builder = AmazonS3Builder::new();
         builder
             .parse_url("https://account123.r2.cloudflarestorage.com/bucket-123")
@@ -1631,6 +1917,18 @@ mod tests {
             Some("https://account123.r2.cloudflarestorage.com".to_string())
         );
 
+        let mut builder = AmazonS3Builder::new();
+        builder
+            .parse_url("https://account123.eu.r2.cloudflarestorage.com/bucket-123")
+            .unwrap();
+
+        assert_eq!(builder.bucket_name, Some("bucket-123".to_string()));
+        assert_eq!(builder.region, Some("auto".to_string()));
+        assert_eq!(
+            builder.endpoint,
+            Some("https://account123.eu.r2.cloudflarestorage.com".to_string())
+        );
+
         let err_cases = [
             "mailto://bucket/path",
             "https://s3.bucket.mydomain.com",
@@ -1638,6 +1936,7 @@ mod tests {
             "https://bucket.mydomain.region.amazonaws.com",
             "https://bucket.s3.region.bar.amazonaws.com",
             "https://bucket.foo.s3.amazonaws.com",
+            "https://account.r2.eu.cloudflarestorage.com/bucket",
         ];
         let mut builder = AmazonS3Builder::new();
         for case in err_cases {
@@ -1645,6 +1944,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn s3_test_proxy_url() {
         let s3 = AmazonS3Builder::new()
@@ -1673,6 +1973,7 @@ mod tests {
         assert_eq!("Generic HTTP client error: builder error", err);
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_invalid_config() {
         let err = AmazonS3Builder::new()
@@ -1700,6 +2001,63 @@ mod tests {
             err,
             "Generic Config error: \"md5\" is not a valid checksum algorithm"
         );
+
+        let err = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::RequestPayer, "requestr")
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Generic Config error: failed to parse \"requestr\" as boolean"
+        );
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn test_request_payer_config() {
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::RequestPayer, "requester")
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap();
+        assert!(s3.client.config.request_payer);
+
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::RequestPayer, "REQUESTER")
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap();
+        assert!(s3.client.config.request_payer);
+
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::RequestPayer, "true")
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap();
+        assert!(s3.client.config.request_payer);
+
+        let s3 = AmazonS3Builder::new()
+            .with_config(AmazonS3ConfigKey::RequestPayer, "false")
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap();
+        assert!(!s3.client.config.request_payer);
+
+        let s3 = AmazonS3Builder::new()
+            .with_request_payer(true)
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .build()
+            .unwrap();
+        assert!(s3.client.config.request_payer);
     }
 
     #[test]
@@ -1707,8 +2065,11 @@ mod tests {
         let cases = [
             ("bucket-base-name--usw2-az1--x-s3", Some("usw2-az1")),
             ("bucket-base--name--azid--x-s3", Some("azid")),
+            ("bucket-base-name--use1-az4--xa-s3", Some("use1-az4")),
+            ("bucket-base--name--azid--xa-s3", Some("azid")),
             ("bucket-base-name", None),
             ("bucket-base-name--x-s3", None),
+            ("bucket-base-name--xa-s3", None),
         ];
 
         for (bucket, expected) in cases {
@@ -1729,6 +2090,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_builder_eks_with_config() {
         let builder = AmazonS3Builder::new()
@@ -1751,6 +2113,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_builder_web_identity_with_config() {
         let builder = AmazonS3Builder::new()

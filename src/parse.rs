@@ -52,7 +52,7 @@ impl From<Error> for super::Error {
 /// - `memory:///` -> [`InMemory`]
 /// - `s3://bucket/path` -> [`AmazonS3`](crate::aws::AmazonS3) (also supports `s3a`)
 /// - `gs://bucket/path` -> [`GoogleCloudStorage`](crate::gcp::GoogleCloudStorage)
-/// - `az://account/container/path` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure) (also supports `adl`, `azure`, `abfs`, `abfss`)
+/// - `[az|abfs[s]]://container[@<account>.<host>]/path` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure)
 /// - `http://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
 /// - `https://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
 ///
@@ -110,8 +110,9 @@ impl ObjectStoreScheme {
             ("memory", None) => (Self::Memory, url.path()),
             ("s3" | "s3a", Some(_)) => (Self::AmazonS3, url.path()),
             ("gs", Some(_)) => (Self::GoogleCloudStorage, url.path()),
-            ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
-            ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
+            ("az" | "adl" | "azure" | "abfs" | "abfss", Some(_)) => {
+                (Self::MicrosoftAzure, url.path())
+            }
             ("http", Some(_)) => (Self::Http, url.path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
@@ -138,12 +139,12 @@ impl ObjectStoreScheme {
     }
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "cloud-base")]
 macro_rules! builder_opts {
     ($builder:ty, $url:expr, $options:expr) => {{
         let builder = $options.into_iter().fold(
             <$builder>::new().with_url($url.to_string()),
-            |builder, (key, value)| match key.as_ref().parse() {
+            |builder, (key, value)| match key.as_ref().to_ascii_lowercase().parse() {
                 Ok(k) => builder.with_config(k, value),
                 Err(_) => builder,
             },
@@ -176,8 +177,7 @@ pub fn parse_url(url: &Url) -> Result<(Box<dyn ObjectStore>, Path), super::Error
 /// * `options`: A list of key-value pairs to pass to the [`ObjectStore`] builder.
 ///   Note different object stores accept different configuration options, so
 ///   the options that are read depends on the `url` value. One common pattern
-///   is to pass configuration information via process variables using
-///   [`std::env::vars`].
+///   is to pass configuration information via process variables using [`std::env::vars`].
 ///
 /// Returns
 /// - An [`ObjectStore`] of the corresponding type
@@ -201,29 +201,29 @@ where
         #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()) as _,
         ObjectStoreScheme::Memory => Box::new(InMemory::new()) as _,
-        #[cfg(feature = "aws")]
+        #[cfg(feature = "aws-base")]
         ObjectStoreScheme::AmazonS3 => {
             builder_opts!(crate::aws::AmazonS3Builder, url, _options)
         }
-        #[cfg(feature = "gcp")]
+        #[cfg(feature = "gcp-base")]
         ObjectStoreScheme::GoogleCloudStorage => {
             builder_opts!(crate::gcp::GoogleCloudStorageBuilder, url, _options)
         }
-        #[cfg(feature = "azure")]
+        #[cfg(feature = "azure-base")]
         ObjectStoreScheme::MicrosoftAzure => {
             builder_opts!(crate::azure::MicrosoftAzureBuilder, url, _options)
         }
-        #[cfg(feature = "http")]
+        #[cfg(feature = "http-base")]
         ObjectStoreScheme::Http => {
             let url = &url[..url::Position::BeforePath];
             builder_opts!(crate::http::HttpBuilder, url, _options)
         }
         #[cfg(not(all(
             feature = "fs",
-            feature = "aws",
-            feature = "azure",
-            feature = "gcp",
-            feature = "http",
+            feature = "aws-base",
+            feature = "azure-base",
+            feature = "gcp-base",
+            feature = "http-base",
             not(target_arch = "wasm32")
         )))]
         s => {
@@ -240,6 +240,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::Url;
 
     #[test]
     fn test_parse() {
@@ -261,6 +262,14 @@ mod tests {
             (
                 "https://bucket.s3.region.amazonaws.com",
                 (ObjectStoreScheme::AmazonS3, ""),
+            ),
+            (
+                "https://s3.dualstack.us-east-1.amazonaws.com/bucket/path",
+                (ObjectStoreScheme::AmazonS3, "path"),
+            ),
+            (
+                "https://bucket.s3.dualstack.us-east-1.amazonaws.com/path",
+                (ObjectStoreScheme::AmazonS3, "path"),
             ),
             (
                 "https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket",
@@ -299,11 +308,35 @@ mod tests {
                 (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
-                "az://account/container",
-                (ObjectStoreScheme::MicrosoftAzure, ""),
+                "az://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
-                "az://account/container/path",
+                "az://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfs://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfs://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfss://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfss://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "adl://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "adl://container@account/path",
                 (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
@@ -398,8 +431,29 @@ mod tests {
         assert_eq!(path.as_ref(), "my file with spaces");
     }
 
+    #[test]
+    #[cfg(feature = "gcp")]
+    fn test_url_gcs_bearer_token_opts() {
+        let url = Url::parse("gs://bucket/path").unwrap();
+
+        for alias in ["google_bearer_token", "bearer_token"] {
+            let opts = [
+                (alias, "test-token"),
+                ("google_proxy_url", "https://example.com"),
+            ];
+
+            let (store, path) = parse_url_opts(&url, opts).unwrap();
+            assert_eq!(path.as_ref(), "path");
+            assert_eq!(store.to_string(), "GoogleCloudStorage(bucket)");
+        }
+    }
+
     #[tokio::test]
-    #[cfg(all(feature = "http", not(target_arch = "wasm32")))]
+    #[cfg(all(
+        feature = "reqwest",
+        feature = "http-base",
+        not(target_arch = "wasm32")
+    ))]
     async fn test_url_http() {
         use crate::{ObjectStoreExt, client::mock_server::MockServer};
         use http::{Response, header::USER_AGENT};
@@ -409,15 +463,19 @@ mod tests {
         server.push_fn(|r| {
             assert_eq!(r.uri().path(), "/foo/bar");
             assert_eq!(r.headers().get(USER_AGENT).unwrap(), "test_url");
-            Response::new(String::new())
+            Response::new(String::from("result"))
         });
 
         let test = format!("{}/foo/bar", server.url());
-        let opts = [("user_agent", "test_url"), ("allow_http", "true")];
+        let opts = [("USER_AGENT", "test_url"), ("allow_http", "true")];
         let url = test.parse().unwrap();
         let (store, path) = parse_url_opts(&url, opts).unwrap();
         assert_eq!(path.as_ref(), "foo/bar");
-        store.get(&path).await.unwrap();
+
+        let res = store.get(&path).await.unwrap();
+        let body = res.bytes().await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(body, "result");
 
         server.shutdown().await;
     }

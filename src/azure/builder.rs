@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::azure::client::{AzureClient, AzureConfig};
+use crate::azure::client::{AzureClient, AzureConfig, AzureEncryptionHeaders};
 use crate::azure::credential::{
     AzureAccessKey, AzureCliCredential, ClientSecretOAuthProvider, FabricTokenOAuthProvider,
     ImdsManagedIdentityProvider, WorkloadIdentityOAuthProvider,
 };
 use crate::azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzure, STORE};
-use crate::client::{HttpConnector, TokenCredentialProvider, http_connector};
+use crate::client::{CryptoProvider, HttpConnector, TokenCredentialProvider, http_connector};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
 use percent_encoding::percent_decode_str;
@@ -85,8 +85,25 @@ enum Error {
     #[error("Missing component in SAS query pair")]
     MissingSasComponent {},
 
+    #[error("Invalid encryption key: {source}")]
+    InvalidEncryptionKey {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[error("Configuration key: '{}' is not known.", key)]
     UnknownConfigurationKey { key: String },
+
+    #[error(
+        "Unknown credential type: '{}'. Supported values: auto, bearer_token, access_key, client_secret, workload_identity, sas_token, azure_cli, managed_identity",
+        credential_type
+    )]
+    UnknownCredentialType { credential_type: String },
+
+    #[error(
+        "Credential type '{}' was requested but required configuration is missing",
+        credential_type
+    )]
+    MissingCredentialConfig { credential_type: String },
 }
 
 impl From<Error> for crate::Error {
@@ -162,6 +179,8 @@ pub struct MicrosoftAzureBuilder {
     client_options: ClientOptions,
     /// Credentials
     credentials: Option<AzureCredentialProvider>,
+    /// The [`CryptoProvider`] to use
+    crypto: Option<Arc<dyn CryptoProvider>>,
     /// Skip signing requests
     skip_signature: ConfigValue<bool>,
     /// When set to true, fabric url scheme will be used
@@ -178,6 +197,10 @@ pub struct MicrosoftAzureBuilder {
     fabric_session_token: Option<String>,
     /// Fabric cluster identifier
     fabric_cluster_identifier: Option<String>,
+    /// Credential type override
+    credential_type: Option<String>,
+    /// Base64-encoded 256-bit customer-provided encryption key
+    encryption_key: Option<String>,
     /// The [`HttpConnector`] to use
     http_connector: Option<Arc<dyn HttpConnector>>,
 }
@@ -380,6 +403,34 @@ pub enum AzureConfigKey {
     /// - `fabric_cluster_identifier`
     FabricClusterIdentifier,
 
+    /// Credential type to use for authentication
+    ///
+    /// When multiple credential configurations are present, this key forces
+    /// the builder to use a specific credential type instead of relying on
+    /// the default resolution order.
+    ///
+    /// Supported values:
+    /// - `auto` (default) — use the built-in priority chain
+    /// - `bearer_token` — use a static bearer token
+    /// - `access_key` — use an access key
+    /// - `client_secret` — use client secret (service principal) OAuth
+    /// - `workload_identity` — use workload identity federation
+    /// - `sas_token` — use a shared access signature
+    /// - `azure_cli` — use Azure CLI
+    /// - `managed_identity` — use IMDS managed identity
+    ///
+    /// Supported keys:
+    /// - `azure_credential_type`
+    /// - `credential_type`
+    CredentialType,
+
+    /// Base64-encoded customer-provided encryption key
+    ///
+    /// Supported keys:
+    /// - `azure_storage_encryption_key`
+    /// - `encryption_key`
+    EncryptionKey,
+
     /// Client options
     Client(ClientConfigKey),
 }
@@ -410,6 +461,8 @@ impl AsRef<str> for AzureConfigKey {
             Self::FabricWorkloadHost => "azure_fabric_workload_host",
             Self::FabricSessionToken => "azure_fabric_session_token",
             Self::FabricClusterIdentifier => "azure_fabric_cluster_identifier",
+            Self::CredentialType => "azure_credential_type",
+            Self::EncryptionKey => "azure_storage_encryption_key",
             Self::Client(key) => key.as_ref(),
         }
     }
@@ -466,6 +519,8 @@ impl FromStr for AzureConfigKey {
             "azure_fabric_cluster_identifier" | "fabric_cluster_identifier" => {
                 Ok(Self::FabricClusterIdentifier)
             }
+            "azure_credential_type" | "credential_type" => Ok(Self::CredentialType),
+            "azure_storage_encryption_key" | "encryption_key" => Ok(Self::EncryptionKey),
             // Backwards compatibility
             "azure_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
             _ => match s.strip_prefix("azure_").unwrap_or(s).parse() {
@@ -594,6 +649,8 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::FabricClusterIdentifier => {
                 self.fabric_cluster_identifier = Some(value.into())
             }
+            AzureConfigKey::CredentialType => self.credential_type = Some(value.into()),
+            AzureConfigKey::EncryptionKey => self.encryption_key = Some(value.into()),
         };
         self
     }
@@ -635,6 +692,8 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::FabricWorkloadHost => self.fabric_workload_host.clone(),
             AzureConfigKey::FabricSessionToken => self.fabric_session_token.clone(),
             AzureConfigKey::FabricClusterIdentifier => self.fabric_cluster_identifier.clone(),
+            AzureConfigKey::CredentialType => self.credential_type.clone(),
+            AzureConfigKey::EncryptionKey => self.encryption_key.clone(),
         }
     }
 
@@ -664,18 +723,63 @@ impl MicrosoftAzureBuilder {
                 // or the convention for the hadoop driver abfs[s]://<file_system>@<account_name>.dfs.core.windows.net/<path>
                 if parsed.username().is_empty() {
                     self.container_name = Some(validate(host)?);
-                } else if let Some(a) = host.strip_suffix(".dfs.core.windows.net") {
-                    self.container_name = Some(validate(parsed.username())?);
-                    self.account_name = Some(validate(a)?);
-                } else if let Some(a) = host.strip_suffix(".dfs.fabric.microsoft.com") {
-                    self.container_name = Some(validate(parsed.username())?);
-                    self.account_name = Some(validate(a)?);
-                    self.use_fabric_endpoint = true.into();
                 } else {
-                    return Err(Error::UrlNotRecognised { url: url.into() }.into());
+                    match host.split_once('.') {
+                        // Workspace-level Private Link detection
+                        // "{workspaceid}.z??.(onelake|dfs|blob).fabric.microsoft.com"
+                        Some((workspaceid, rest))
+                            if rest.starts_with('z') && rest.ends_with("fabric.microsoft.com") =>
+                        {
+                            // Account name for WS-PL is two labels: "{workspaceid}.z{xy}"
+                            let (zone, _) = rest.split_once('.').unwrap_or((rest, ""));
+
+                            self.account_name = Some(format!("{workspaceid}.{zone}"));
+                            self.endpoint = Some(format!("https://{}", host));
+
+                            self.container_name = Some(validate(parsed.username())?);
+                            self.use_fabric_endpoint = true.into();
+                        }
+
+                        Some((a, "dfs.core.windows.net")) | Some((a, "blob.core.windows.net")) => {
+                            self.account_name = Some(validate(a)?);
+                            self.container_name = Some(validate(parsed.username())?);
+                        }
+
+                        Some((a, "dfs.fabric.microsoft.com"))
+                        | Some((a, "blob.fabric.microsoft.com")) => {
+                            self.account_name = Some(validate(a)?);
+                            self.container_name = Some(validate(parsed.username())?);
+                            self.use_fabric_endpoint = true.into();
+                        }
+                        _ => return Err(Error::UrlNotRecognised { url: url.into() }.into()),
+                    }
                 }
             }
             "https" => match host.split_once('.') {
+                // Workspace-level Private Link detection
+                // "{workspaceid}.z??.(onelake|dfs|blob).fabric.microsoft.com"
+                Some((workspaceid, rest))
+                    if rest.starts_with('z') && rest.ends_with("fabric.microsoft.com") =>
+                {
+                    // rest looks like: "z28.dfs.fabric.microsoft.com" / "z28.blob.fabric.microsoft.com" / etc.
+                    // Account name for WS-PL is two labels: "{workspaceid}.z{xy}"
+                    let (zone, _) = rest.split_once('.').unwrap_or((rest, ""));
+
+                    self.account_name = Some(format!("{workspaceid}.{zone}"));
+                    self.endpoint = Some(format!("https://{}", host));
+
+                    // Attempt to infer the container name from the URL
+                    let container = parsed.path_segments().unwrap().next().expect(
+                        "iterator always contains at least one string (which may be empty)",
+                    );
+
+                    if !container.is_empty() {
+                        self.container_name = Some(validate(container)?);
+                    }
+
+                    self.use_fabric_endpoint = true.into();
+                }
+
                 Some((a, "dfs.core.windows.net")) | Some((a, "blob.core.windows.net")) => {
                     self.account_name = Some(validate(a)?);
                     let container = parsed.path_segments().unwrap().next().expect(
@@ -774,6 +878,12 @@ impl MicrosoftAzureBuilder {
     /// Set the credential provider overriding any other options
     pub fn with_credentials(mut self, credentials: AzureCredentialProvider) -> Self {
         self.credentials = Some(credentials);
+        self
+    }
+
+    /// The [`CryptoProvider`] to use
+    pub fn with_crypto_provider(mut self, provider: Arc<dyn CryptoProvider>) -> Self {
+        self.crypto = Some(provider);
         self
     }
 
@@ -879,6 +989,19 @@ impl MicrosoftAzureBuilder {
         self
     }
 
+    /// Set the credential type to use for authentication.
+    ///
+    /// When multiple credential configurations are present (e.g. both workload identity
+    /// and client secret), this forces the builder to use a specific credential type
+    /// instead of relying on the default resolution order.
+    ///
+    /// Supported values: `auto`, `bearer_token`, `access_key`, `client_secret`,
+    /// `workload_identity`, `sas_token`, `azure_cli`, `managed_identity`.
+    pub fn with_credential_type(mut self, credential_type: impl Into<String>) -> Self {
+        self.credential_type = Some(credential_type.into());
+        self
+    }
+
     /// If enabled, [`MicrosoftAzure`] will not fetch credentials and will not sign requests
     ///
     /// This can be useful when interacting with public containers
@@ -893,6 +1016,25 @@ impl MicrosoftAzureBuilder {
         self
     }
 
+    /// Set the customer-provided encryption key (CPK) used to encrypt blob content.
+    ///
+    /// `key` must be a base64-encoded 256-bit AES key (the decoded value must be
+    /// exactly 32 bytes). The same key must be supplied on every subsequent read,
+    /// write, or copy of any blob created with it; if the key is lost or omitted
+    /// the data is unrecoverable. CPK material is sent to Azure on every request,
+    /// so the configured endpoint must use HTTPS.
+    ///
+    /// Only a subset of Blob storage operations support CPK
+    /// (see the [Azure documentation][cpk-ops]). When CPK is enabled, `copy`
+    /// switches from the asynchronous `Copy Blob` API to `Put Blob From URL`,
+    /// which is synchronous and limits the source blob to 5,000 MiB.
+    ///
+    /// [cpk-ops]: https://learn.microsoft.com/en-us/azure/storage/blobs/encryption-customer-provided-keys#blob-storage-operations-supporting-customer-provided-keys
+    pub fn with_encryption_key(mut self, key: impl Into<String>) -> Self {
+        self.encryption_key = Some(key.into());
+        self
+    }
+
     /// The [`HttpConnector`] to use
     ///
     /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
@@ -901,19 +1043,201 @@ impl MicrosoftAzureBuilder {
         self
     }
 
+    fn resolve_credential_auto(
+        &mut self,
+        http: &Arc<dyn HttpConnector>,
+    ) -> Result<AzureCredentialProvider> {
+        if let (
+            Some(fabric_token_service_url),
+            Some(fabric_workload_host),
+            Some(fabric_session_token),
+            Some(fabric_cluster_identifier),
+        ) = (
+            &self.fabric_token_service_url,
+            &self.fabric_workload_host,
+            &self.fabric_session_token,
+            &self.fabric_cluster_identifier,
+        ) {
+            let fabric_credential = FabricTokenOAuthProvider::new(
+                fabric_token_service_url,
+                fabric_workload_host,
+                fabric_session_token,
+                fabric_cluster_identifier,
+                self.bearer_token.clone(),
+            );
+            Ok(Arc::new(TokenCredentialProvider::new(
+                fabric_credential,
+                http.connect(&self.client_options)?,
+                self.retry_config.clone(),
+            )) as _)
+        } else if self.bearer_token.is_some() {
+            self.resolve_bearer_token()
+        } else if self.access_key.is_some() {
+            self.resolve_access_key()
+        } else if self.client_id.is_some()
+            && self.tenant_id.is_some()
+            && self.federated_token_file.is_some()
+        {
+            self.resolve_workload_identity(http)
+        } else if self.client_id.is_some()
+            && self.client_secret.is_some()
+            && self.tenant_id.is_some()
+        {
+            self.resolve_client_secret(http)
+        } else if self.sas_query_pairs.is_some() || self.sas_key.is_some() {
+            self.resolve_sas_token()
+        } else if self.use_azure_cli.get()? {
+            Ok(Arc::new(AzureCliCredential::new()) as _)
+        } else {
+            self.resolve_managed_identity(http)
+        }
+    }
+
+    fn resolve_bearer_token(&mut self) -> Result<AzureCredentialProvider> {
+        let bearer_token = self
+            .bearer_token
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "bearer_token".to_string(),
+            })?;
+        Ok(Arc::new(StaticCredentialProvider::new(
+            AzureCredential::BearerToken(bearer_token),
+        )))
+    }
+
+    fn resolve_access_key(&mut self) -> Result<AzureCredentialProvider> {
+        let access_key = self
+            .access_key
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "access_key".to_string(),
+            })?;
+        let key = AzureAccessKey::try_new(&access_key)?;
+        Ok(Arc::new(StaticCredentialProvider::new(
+            AzureCredential::AccessKey(key),
+        )))
+    }
+
+    fn resolve_client_secret(
+        &mut self,
+        http: &Arc<dyn HttpConnector>,
+    ) -> Result<AzureCredentialProvider> {
+        let client_id = self
+            .client_id
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "client_secret".to_string(),
+            })?;
+        let client_secret = self
+            .client_secret
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "client_secret".to_string(),
+            })?;
+        let tenant_id = self
+            .tenant_id
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "client_secret".to_string(),
+            })?;
+        let client_credential = ClientSecretOAuthProvider::new(
+            client_id,
+            client_secret,
+            &tenant_id,
+            self.authority_host.take(),
+        );
+        Ok(Arc::new(TokenCredentialProvider::new(
+            client_credential,
+            http.connect(&self.client_options)?,
+            self.retry_config.clone(),
+        )) as _)
+    }
+
+    fn resolve_workload_identity(
+        &mut self,
+        http: &Arc<dyn HttpConnector>,
+    ) -> Result<AzureCredentialProvider> {
+        let client_id = self
+            .client_id
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "workload_identity".to_string(),
+            })?;
+        let tenant_id = self
+            .tenant_id
+            .take()
+            .ok_or(Error::MissingCredentialConfig {
+                credential_type: "workload_identity".to_string(),
+            })?;
+        let federated_token_file =
+            self.federated_token_file
+                .take()
+                .ok_or(Error::MissingCredentialConfig {
+                    credential_type: "workload_identity".to_string(),
+                })?;
+        let client_credential = WorkloadIdentityOAuthProvider::new(
+            &client_id,
+            federated_token_file,
+            &tenant_id,
+            self.authority_host.take(),
+        );
+        Ok(Arc::new(TokenCredentialProvider::new(
+            client_credential,
+            http.connect(&self.client_options)?,
+            self.retry_config.clone(),
+        )) as _)
+    }
+
+    fn resolve_sas_token(&mut self) -> Result<AzureCredentialProvider> {
+        if let Some(query_pairs) = self.sas_query_pairs.take() {
+            Ok(Arc::new(StaticCredentialProvider::new(
+                AzureCredential::SASToken(query_pairs),
+            )))
+        } else if let Some(sas) = self.sas_key.take() {
+            Ok(Arc::new(StaticCredentialProvider::new(
+                AzureCredential::SASToken(split_sas(&sas)?),
+            )))
+        } else {
+            Err(Error::MissingCredentialConfig {
+                credential_type: "sas_token".to_string(),
+            }
+            .into())
+        }
+    }
+
+    fn resolve_managed_identity(
+        &mut self,
+        http: &Arc<dyn HttpConnector>,
+    ) -> Result<AzureCredentialProvider> {
+        let msi_credential = ImdsManagedIdentityProvider::new(
+            self.client_id.take(),
+            self.object_id.take(),
+            self.msi_resource_id.take(),
+            self.msi_endpoint.take(),
+        );
+        Ok(Arc::new(TokenCredentialProvider::new(
+            msi_credential,
+            http.connect(&self.client_options.metadata_options())?,
+            self.retry_config.clone(),
+        )) as _)
+    }
+
     /// Configure a connection to container with given name on Microsoft Azure Blob store.
     pub fn build(mut self) -> Result<MicrosoftAzure> {
         if let Some(url) = self.url.take() {
             self.parse_url(&url)?;
         }
 
-        let container = self.container_name.ok_or(Error::MissingContainerName {})?;
+        let container = self
+            .container_name
+            .take()
+            .ok_or(Error::MissingContainerName {})?;
 
         let static_creds = |credential: AzureCredential| -> AzureCredentialProvider {
             Arc::new(StaticCredentialProvider::new(credential))
         };
 
-        let http = http_connector(self.http_connector)?;
+        let http = http_connector(self.http_connector.take())?;
 
         let (is_emulator, storage_url, auth, account) = if self.use_emulator.get()? {
             let account_name = self
@@ -937,14 +1261,14 @@ impl MicrosoftAzureBuilder {
             self.client_options = self.client_options.with_allow_http(true);
             (true, url, static_creds(credential), account_name)
         } else {
-            let account_name = self.account_name.ok_or(Error::MissingAccount {})?;
-            let account_url = match self.endpoint {
+            let account_name = self.account_name.take().ok_or(Error::MissingAccount {})?;
+            let account_url = match self.endpoint.take() {
                 Some(account_url) => account_url,
                 None => match self.use_fabric_endpoint.get()? {
                     true => {
-                        format!("https://{}.blob.fabric.microsoft.com", &account_name)
+                        format!("https://{}.blob.fabric.microsoft.com", account_name)
                     }
-                    false => format!("https://{}.blob.core.windows.net", &account_name),
+                    false => format!("https://{}.blob.core.windows.net", account_name),
                 },
             };
 
@@ -955,84 +1279,38 @@ impl MicrosoftAzureBuilder {
 
             let credential = if let Some(credential) = self.credentials {
                 credential
-            } else if let (
-                Some(fabric_token_service_url),
-                Some(fabric_workload_host),
-                Some(fabric_session_token),
-                Some(fabric_cluster_identifier),
-            ) = (
-                &self.fabric_token_service_url,
-                &self.fabric_workload_host,
-                &self.fabric_session_token,
-                &self.fabric_cluster_identifier,
-            ) {
-                // This case should precede the bearer token case because it is more specific and will utilize the bearer token.
-                let fabric_credential = FabricTokenOAuthProvider::new(
-                    fabric_token_service_url,
-                    fabric_workload_host,
-                    fabric_session_token,
-                    fabric_cluster_identifier,
-                    self.bearer_token.clone(),
-                );
-                Arc::new(TokenCredentialProvider::new(
-                    fabric_credential,
-                    http.connect(&self.client_options)?,
-                    self.retry_config.clone(),
-                )) as _
-            } else if let Some(bearer_token) = self.bearer_token {
-                static_creds(AzureCredential::BearerToken(bearer_token))
-            } else if let Some(access_key) = self.access_key {
-                let key = AzureAccessKey::try_new(&access_key)?;
-                static_creds(AzureCredential::AccessKey(key))
-            } else if let (Some(client_id), Some(tenant_id), Some(federated_token_file)) =
-                (&self.client_id, &self.tenant_id, self.federated_token_file)
-            {
-                let client_credential = WorkloadIdentityOAuthProvider::new(
-                    client_id,
-                    federated_token_file,
-                    tenant_id,
-                    self.authority_host,
-                );
-                Arc::new(TokenCredentialProvider::new(
-                    client_credential,
-                    http.connect(&self.client_options)?,
-                    self.retry_config.clone(),
-                )) as _
-            } else if let (Some(client_id), Some(client_secret), Some(tenant_id)) =
-                (&self.client_id, self.client_secret, &self.tenant_id)
-            {
-                let client_credential = ClientSecretOAuthProvider::new(
-                    client_id.clone(),
-                    client_secret,
-                    tenant_id,
-                    self.authority_host,
-                );
-                Arc::new(TokenCredentialProvider::new(
-                    client_credential,
-                    http.connect(&self.client_options)?,
-                    self.retry_config.clone(),
-                )) as _
-            } else if let Some(query_pairs) = self.sas_query_pairs {
-                static_creds(AzureCredential::SASToken(query_pairs))
-            } else if let Some(sas) = self.sas_key {
-                static_creds(AzureCredential::SASToken(split_sas(&sas)?))
-            } else if self.use_azure_cli.get()? {
-                Arc::new(AzureCliCredential::new()) as _
             } else {
-                let msi_credential = ImdsManagedIdentityProvider::new(
-                    self.client_id,
-                    self.object_id,
-                    self.msi_resource_id,
-                    self.msi_endpoint,
-                );
-                Arc::new(TokenCredentialProvider::new(
-                    msi_credential,
-                    http.connect(&self.client_options.metadata_options())?,
-                    self.retry_config.clone(),
-                )) as _
+                let credential_type = self.credential_type.as_deref().unwrap_or("auto");
+
+                match credential_type {
+                    "auto" => self.resolve_credential_auto(&http)?,
+                    "bearer_token" => self.resolve_bearer_token()?,
+                    "access_key" => self.resolve_access_key()?,
+                    "client_secret" => self.resolve_client_secret(&http)?,
+                    "workload_identity" => self.resolve_workload_identity(&http)?,
+                    "sas_token" => self.resolve_sas_token()?,
+                    "azure_cli" => Arc::new(AzureCliCredential::new()) as _,
+                    "managed_identity" => self.resolve_managed_identity(&http)?,
+                    other => {
+                        return Err(Error::UnknownCredentialType {
+                            credential_type: other.to_string(),
+                        }
+                        .into());
+                    }
+                }
             };
             (false, url, credential, account_name)
         };
+
+        let encryption_headers =
+            AzureEncryptionHeaders::try_new(self.crypto.as_deref(), self.encryption_key).map_err(
+                |source| Error::InvalidEncryptionKey {
+                    source: match source {
+                        crate::Error::Generic { source, .. } => source,
+                        other => Box::new(other),
+                    },
+                },
+            )?;
 
         let config = AzureConfig {
             account,
@@ -1044,6 +1322,8 @@ impl MicrosoftAzureBuilder {
             client_options: self.client_options,
             service: storage_url,
             credentials: auth,
+            crypto: self.crypto,
+            encryption_headers,
         };
 
         let http_client = http.connect(&config.client_options)?;
@@ -1069,7 +1349,8 @@ fn url_from_env(env_name: &str, default_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn split_sas(sas: &str) -> Result<Vec<(String, String)>, Error> {
+/// Parse a SAS token string into the query pairs expected by [`AzureCredential::SASToken`].
+pub fn split_sas(sas: &str) -> Result<Vec<(String, String)>> {
     let sas = percent_decode_str(sas)
         .decode_utf8()
         .map_err(|source| Error::DecodeSasKey { source })?;
@@ -1091,6 +1372,8 @@ fn split_sas(sas: &str) -> Result<Vec<(String, String)>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
     use std::collections::HashMap;
 
     #[test]
@@ -1110,6 +1393,30 @@ mod tests {
         assert_eq!(builder.account_name, Some("account".to_string()));
         assert_eq!(builder.container_name, Some("container".to_string()));
         assert!(!builder.use_fabric_endpoint.get().unwrap());
+
+        let mut builder = MicrosoftAzureBuilder::new();
+        builder
+            .parse_url("az://container@account.blob.core.windows.net/path-part/file")
+            .unwrap();
+        assert_eq!(builder.account_name, Some("account".to_string()));
+        assert_eq!(builder.container_name, Some("container".to_string()));
+        assert!(!builder.use_fabric_endpoint.get().unwrap());
+
+        let mut builder = MicrosoftAzureBuilder::new();
+        builder
+            .parse_url("az://container@account.dfs.fabric.microsoft.com/path-part/file")
+            .unwrap();
+        assert_eq!(builder.account_name, Some("account".to_string()));
+        assert_eq!(builder.container_name, Some("container".to_string()));
+        assert!(builder.use_fabric_endpoint.get().unwrap());
+
+        let mut builder = MicrosoftAzureBuilder::new();
+        builder
+            .parse_url("az://container@account.blob.fabric.microsoft.com/path-part/file")
+            .unwrap();
+        assert_eq!(builder.account_name, Some("account".to_string()));
+        assert_eq!(builder.container_name, Some("container".to_string()));
+        assert!(builder.use_fabric_endpoint.get().unwrap());
 
         let mut builder = MicrosoftAzureBuilder::new();
         builder
@@ -1176,6 +1483,17 @@ mod tests {
 
         let mut builder = MicrosoftAzureBuilder::new();
         builder
+            .parse_url("https://onelake.dfs.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456.lakehouse/Files/tables/sales/data.parquet")
+            .unwrap();
+        assert_eq!(builder.account_name, Some("onelake".to_string()));
+        assert_eq!(
+            builder.container_name.as_deref(),
+            Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3")
+        );
+        assert!(builder.use_fabric_endpoint.get().unwrap());
+
+        let mut builder = MicrosoftAzureBuilder::new();
+        builder
             .parse_url("https://account.blob.fabric.microsoft.com/")
             .unwrap();
         assert_eq!(builder.account_name, Some("account".to_string()));
@@ -1206,6 +1524,130 @@ mod tests {
     }
 
     #[test]
+    fn azure_test_workspace_private_link() {
+        let test_cases: Vec<(&str, &str, Option<&str>)> = vec![
+            (
+                "https://Ab000000000000000000000000000000.zAb.dfs.fabric.microsoft.com/",
+                "ab000000000000000000000000000000.zab",
+                None,
+            ),
+            (
+                "https://ab000000000000000000000000000000.zab.dfs.fabric.microsoft.com/",
+                "ab000000000000000000000000000000.zab",
+                None,
+            ),
+            (
+                "https://c047b3e34e89407a98d7cf9949ae92a3.zc0.blob.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3"),
+            ),
+            (
+                "https://c047b3e34e89407a98d7cf9949ae92a3.zc0.dfs.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3"),
+            ),
+            (
+                "https://c047b3e34e89407a98d7cf9949ae92a3.zc0.onelake.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3"),
+            ),
+            (
+                "https://c047b3e34e89407a98d7cf9949ae92a3.zc0.w.api.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3"),
+            ),
+            (
+                "https://c047b3e34e89407a98d7cf9949ae92a3.zc0.c.api.fabric.microsoft.com/c047b3e3-4e89-407a-98d7-cf9949ae92a3/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e3-4e89-407a-98d7-cf9949ae92a3"),
+            ),
+            (
+                "abfss://c047b3e34e89407a98d7cf9949ae92a3@c047b3e34e89407a98d7cf9949ae92a3.zc0.dfs.fabric.microsoft.com/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e34e89407a98d7cf9949ae92a3"),
+            ),
+            (
+                "abfss://c047b3e34e89407a98d7cf9949ae92a3@c047b3e34e89407a98d7cf9949ae92a3.zc0.blob.fabric.microsoft.com/9f1a2b3c-4d5e-6f70-8a9b-c0d1e2f3a456/file",
+                "c047b3e34e89407a98d7cf9949ae92a3.zc0",
+                Some("c047b3e34e89407a98d7cf9949ae92a3"),
+            ),
+        ];
+
+        for (url, expected_account, expected_container) in &test_cases {
+            let mut builder = MicrosoftAzureBuilder::new();
+            builder.parse_url(url).unwrap();
+
+            assert_eq!(
+                builder.account_name.as_deref(),
+                Some(*expected_account),
+                "account mismatch for URL: {url}"
+            );
+            assert_eq!(
+                builder.container_name.as_deref(),
+                *expected_container,
+                "container mismatch for URL: {url}"
+            );
+            assert!(
+                builder.use_fabric_endpoint.get().unwrap(),
+                "use_fabric_endpoint not set for URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_encryption_key_roundtrip() {
+        let key = BASE64_STANDARD.encode([7_u8; 32]);
+        let builder = MicrosoftAzureBuilder::new().with_encryption_key(&key);
+
+        assert_eq!(
+            builder
+                .get_config_value(&AzureConfigKey::EncryptionKey)
+                .as_deref(),
+            Some(key.as_str())
+        );
+    }
+
+    #[test]
+    fn azure_encryption_key_rejects_malformed_base64() {
+        let err = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_access_key(EMULATOR_ACCOUNT_KEY)
+            .with_encryption_key("not-base64!!!")
+            .build()
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid encryption key") || msg.contains("Invalid byte"));
+    }
+
+    #[test]
+    fn azure_encryption_key_rejects_short_decoded_key() {
+        let err = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_access_key(EMULATOR_ACCOUNT_KEY)
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 31]))
+            .build()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must decode to 32 bytes, got 31"));
+    }
+
+    #[test]
+    fn azure_encryption_key_rejects_long_decoded_key() {
+        let err = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_access_key(EMULATOR_ACCOUNT_KEY)
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 33]))
+            .build()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must decode to 32 bytes, got 33"));
+    }
+
+    #[test]
     fn azure_test_config_from_map() {
         let azure_client_id = "object_store:fake_access_key_id";
         let azure_storage_account_name = "object_store:fake_secret_key";
@@ -1227,6 +1669,74 @@ mod tests {
     }
 
     #[test]
+    fn azure_test_credential_type_config() {
+        let builder = MicrosoftAzureBuilder::new()
+            .with_config(AzureConfigKey::CredentialType, "client_secret");
+        assert_eq!(builder.credential_type, Some("client_secret".to_string()));
+        assert_eq!(
+            builder
+                .get_config_value(&AzureConfigKey::CredentialType)
+                .unwrap(),
+            "client_secret"
+        );
+
+        let builder =
+            MicrosoftAzureBuilder::new().with_config("credential_type".parse().unwrap(), "auto");
+        assert_eq!(builder.credential_type, Some("auto".to_string()));
+    }
+
+    #[test]
+    fn azure_test_credential_type_client_secret() {
+        let builder = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_client_id("client_id")
+            .with_client_secret("client_secret")
+            .with_tenant_id("tenant_id")
+            .with_federated_token_file("/tmp/token")
+            .with_credential_type("client_secret");
+        // Should succeed — client_secret is forced even though workload_identity fields are present
+        let result = builder.build();
+        // Build will fail because it can't actually connect, but it should not fail with
+        // a MissingCredentialConfig error — it should get past credential resolution
+        assert!(
+            result.is_ok(),
+            "Expected build to succeed with credential_type=client_secret, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn azure_test_credential_type_unknown() {
+        let builder = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_credential_type("invalid_type");
+        let result = builder.build();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown credential type"),
+            "Expected unknown credential type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn azure_test_credential_type_missing_config() {
+        let builder = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_credential_type("client_secret");
+        let result = builder.build();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("required configuration is missing"),
+            "Expected missing config error, got: {err}"
+        );
+    }
+
+    #[test]
     fn azure_test_split_sas() {
         let raw_sas = "?sv=2021-10-04&st=2023-01-04T17%3A48%3A57Z&se=2023-01-04T18%3A15%3A00Z&sr=c&sp=rcwl&sig=C7%2BZeEOWbrxPA3R0Cw%2Fw1EZz0%2B4KBvQexeKZKe%2BB6h0%3D";
         let expected = vec![
@@ -1242,6 +1752,27 @@ mod tests {
         ];
         let pairs = split_sas(raw_sas).unwrap();
         assert_eq!(expected, pairs);
+    }
+
+    #[test]
+    fn azure_test_split_sas_trims_leading_question_mark_and_skips_empties() {
+        let pairs = split_sas("?&sv=2021-10-04& &sp=r").unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("sv".to_string(), "2021-10-04".to_string()),
+                ("sp".to_string(), "r".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn azure_test_split_sas_rejects_missing_equals() {
+        let err = split_sas("sv=2021-10-04&bogus").unwrap_err();
+        assert!(
+            err.to_string().contains("Missing component"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]

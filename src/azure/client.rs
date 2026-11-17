@@ -21,10 +21,14 @@ use crate::azure::{AzureCredentialProvider, STORE};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::get::GetClient;
 use crate::client::header::{HeaderConfig, get_put_result};
-use crate::client::list::ListClient;
+use crate::client::list::{ListClient, parse_key};
 use crate::client::retry::{RetryContext, RetryExt};
-use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpRequest, HttpResponse};
-use crate::list::{PaginatedListOptions, PaginatedListResult};
+use crate::client::token::{TemporaryToken, TokenCache};
+use crate::client::{
+    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpRequest,
+    HttpResponse, crypto_provider,
+};
+use crate::list::{InvalidKey, InvalidKeyHandling, PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::util::{GetRange, deserialize_rfc1123};
 use crate::{
@@ -40,11 +44,11 @@ use http::{
     HeaderName, Method,
     header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH},
 };
-use rand::Rng as _;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 const VERSION_HEADER: &str = "x-ms-version-id";
@@ -58,6 +62,25 @@ static MS_CONTENT_ENCODING: HeaderName = HeaderName::from_static("x-ms-blob-cont
 static MS_CONTENT_LANGUAGE: HeaderName = HeaderName::from_static("x-ms-blob-content-language");
 
 static TAGS_HEADER: HeaderName = HeaderName::from_static("x-ms-tags");
+static ENCRYPTION_KEY_HEADER: HeaderName = HeaderName::from_static("x-ms-encryption-key");
+static ENCRYPTION_KEY_SHA256_HEADER: HeaderName =
+    HeaderName::from_static("x-ms-encryption-key-sha256");
+static ENCRYPTION_ALGORITHM_HEADER: HeaderName =
+    HeaderName::from_static("x-ms-encryption-algorithm");
+static SOURCE_ENCRYPTION_KEY_HEADER: HeaderName =
+    HeaderName::from_static("x-ms-source-encryption-key");
+static SOURCE_ENCRYPTION_KEY_SHA256_HEADER: HeaderName =
+    HeaderName::from_static("x-ms-source-encryption-key-sha256");
+static SOURCE_ENCRYPTION_ALGORITHM_HEADER: HeaderName =
+    HeaderName::from_static("x-ms-source-encryption-algorithm");
+static COPY_SOURCE_AUTHORIZATION: HeaderName =
+    HeaderName::from_static("x-ms-copy-source-authorization");
+// Put Blob From URL added source CPK headers in 2026-02-06.
+// https://learn.microsoft.com/en-us/rest/api/storageservices/version-2026-02-06
+// before this version you could only specify CPK headers for the destination.
+// we only upgrade to this version if you are applying CPK headers to a copy request.
+const PUT_BLOB_FROM_URL_SOURCE_CPK_VERSION: &str = "2026-02-06";
+const COPY_SOURCE_SAS_EXPIRES_IN: Duration = Duration::from_secs(3600);
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -70,12 +93,6 @@ pub(crate) enum Error {
 
     #[error("Error performing put request {}: {}", path, source)]
     PutRequest {
-        source: crate::client::retry::RetryError,
-        path: String,
-    },
-
-    #[error("Error performing delete request {}: {}", path, source)]
-    DeleteRequest {
         source: crate::client::retry::RetryError,
         path: String,
     },
@@ -113,6 +130,8 @@ pub(crate) enum Error {
     #[error("Error performing list request: {}", source)]
     ListRequest {
         source: crate::client::retry::RetryError,
+        /// The prefix that was being listed, used only for error classification
+        path: String,
     },
 
     #[error("Error getting list response body: {}", source)]
@@ -151,8 +170,8 @@ impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::GetRequest { source, path }
-            | Error::DeleteRequest { source, path }
-            | Error::PutRequest { source, path } => source.error(STORE, path),
+            | Error::PutRequest { source, path }
+            | Error::ListRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -166,6 +185,7 @@ impl From<Error> for crate::Error {
 pub(crate) struct AzureConfig {
     pub account: String,
     pub container: String,
+    pub crypto: Option<Arc<dyn CryptoProvider>>,
     pub credentials: AzureCredentialProvider,
     pub retry_config: RetryConfig,
     pub service: Url,
@@ -173,6 +193,7 @@ pub(crate) struct AzureConfig {
     pub skip_signature: bool,
     pub disable_tagging: bool,
     pub client_options: ClientOptions,
+    pub encryption_headers: AzureEncryptionHeaders,
 }
 
 impl AzureConfig {
@@ -187,11 +208,150 @@ impl AzureConfig {
         }
         url
     }
+
+    /// Whether a request built with this config must be treated as sensitive.
+    ///
+    /// The retry layer's `sensitive` flag suppresses the request URL from
+    /// error messages (see [`RetryableRequestBuilder::sensitive`]). For SAS
+    /// credentials this is load-bearing because the token is carried as URL
+    /// query parameters.
+    ///
+    /// CPK material lives in request *headers* (`x-ms-encryption-key` etc.),
+    /// not in the URL. Those header values are marked sensitive when added to
+    /// the request, while this flag ensures retry/error formatting also treats
+    /// the whole request as sensitive.
+    ///
+    /// [`RetryableRequestBuilder::sensitive`]: crate::client::retry::RetryableRequestBuilder
+    fn is_sensitive(&self, credential: &Option<Arc<AzureCredential>>) -> bool {
+        let credential_sensitive = credential
+            .as_deref()
+            .map(|c| c.sensitive_request())
+            .unwrap_or_default();
+        credential_sensitive || self.encryption_headers.is_enabled()
+    }
+
     async fn get_credential(&self) -> Result<Option<Arc<AzureCredential>>> {
         if self.skip_signature {
             Ok(None)
         } else {
             Some(self.credentials.get_credential().await).transpose()
+        }
+    }
+}
+
+/// Encryption headers for Azure requests.
+/// Azure only supports AES256 encryption with customer-provided keys.
+#[derive(Default, Clone)]
+pub(crate) struct AzureEncryptionHeaders {
+    pub encryption_key: Option<String>,
+    pub encryption_key_sha256: Option<String>,
+}
+
+impl std::fmt::Debug for AzureEncryptionHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureEncryptionHeaders")
+            .field("key_configured", &self.encryption_key.is_some())
+            .finish()
+    }
+}
+
+impl AzureEncryptionHeaders {
+    pub(crate) fn try_new(
+        crypto: Option<&dyn CryptoProvider>,
+        encryption_key: Option<String>,
+    ) -> Result<Self> {
+        let Some(encryption_key) = encryption_key else {
+            return Ok(Self::default());
+        };
+
+        let decoded_key = BASE64_STANDARD
+            .decode(encryption_key.as_bytes())
+            .map_err(|source| crate::Error::Generic {
+                store: STORE,
+                source: Box::new(source),
+            })?;
+
+        // As above encryption keys must be 256-bit AES keys,
+        // which means the base64-encoded value must decode to 32 bytes.
+        if decoded_key.len() != 32 {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: format!(
+                    "Azure customer-provided encryption key must decode to 32 bytes, got {}",
+                    decoded_key.len()
+                )
+                .into(),
+            });
+        }
+
+        let crypto = crypto_provider(crypto)?;
+        let mut ctx = crypto.digest(DigestAlgorithm::Sha256)?;
+        ctx.update(&decoded_key);
+        let encryption_key_sha256 = BASE64_STANDARD.encode(ctx.finish()?);
+
+        Ok(Self {
+            encryption_key: Some(encryption_key),
+            encryption_key_sha256: Some(encryption_key_sha256),
+        })
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.encryption_key.is_some()
+    }
+}
+
+/// Override the Azure Blob service version used for a single request.
+///
+/// [`with_azure_authorization`](CredentialExt::with_azure_authorization) preserves
+/// an explicit version header instead of replacing it with the backend default.
+pub(crate) trait RequestVersionExt {
+    fn with_azure_version(self, version: &'static str) -> Self;
+}
+
+impl RequestVersionExt for HttpRequestBuilder {
+    fn with_azure_version(self, version: &'static str) -> Self {
+        self.header(&VERSION, version)
+    }
+}
+
+/// Request-builder extension for customer-provided encryption keys (CPK).
+pub(crate) trait EncryptionHeadersExt {
+    /// The only encryption algorithm supported by Azure when using customer-provided keys.
+    const AES256: &'static str = "AES256";
+
+    /// Apply the customer-provided encryption headers for the request target.
+    /// <https://learn.microsoft.com/en-us/azure/storage/blobs/encryption-customer-provided-keys>
+    fn with_azure_encryption_headers(self, headers: &AzureEncryptionHeaders) -> Self;
+
+    /// Apply the customer-provided encryption headers for a copy *source*.
+    ///
+    /// When performing a copy operation with a customer-provided key, the standard x-ms-encryption-*
+    /// headers apply to the destination, with separate x-ms-source-encryption-* headers for the source.
+    ///
+    /// <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url?tabs=microsoft-entra-id#request-headers-source-customer-provided-encryption-keys>
+    fn with_azure_source_encryption_headers(self, headers: &AzureEncryptionHeaders) -> Self;
+}
+
+impl EncryptionHeadersExt for HttpRequestBuilder {
+    fn with_azure_encryption_headers(self, headers: &AzureEncryptionHeaders) -> Self {
+        match (&headers.encryption_key, &headers.encryption_key_sha256) {
+            (Some(encryption_key), Some(encryption_key_sha256)) => self
+                // The key is secret material, so mark it sensitive to keep it
+                // out of any `Debug`/diagnostic output.
+                .sensitive_header(&ENCRYPTION_KEY_HEADER, encryption_key)
+                .sensitive_header(&ENCRYPTION_KEY_SHA256_HEADER, encryption_key_sha256)
+                .header(&ENCRYPTION_ALGORITHM_HEADER, Self::AES256),
+            _ => self,
+        }
+    }
+
+    fn with_azure_source_encryption_headers(self, headers: &AzureEncryptionHeaders) -> Self {
+        match (&headers.encryption_key, &headers.encryption_key_sha256) {
+            (Some(encryption_key), Some(encryption_key_sha256)) => self
+                .sensitive_header(&SOURCE_ENCRYPTION_KEY_HEADER, encryption_key)
+                .sensitive_header(&SOURCE_ENCRYPTION_KEY_SHA256_HEADER, encryption_key_sha256)
+                .header(&SOURCE_ENCRYPTION_ALGORITHM_HEADER, Self::AES256),
+            _ => self,
         }
     }
 }
@@ -266,14 +426,13 @@ impl PutRequest<'_> {
 
     async fn send(self) -> Result<HttpResponse> {
         let credential = self.config.get_credential().await?;
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
+        let crypto = self.config.crypto.as_deref();
         let response = self
             .builder
+            .with_azure_encryption_headers(&self.config.encryption_headers)
             .header(CONTENT_LENGTH, self.payload.content_length())
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(crypto, &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(self.idempotent)
@@ -461,7 +620,7 @@ async fn parse_blob_batch_delete_body(
 
         // Parse part response headers
         // Documentation mentions 5 headers and states that other standard HTTP headers
-        // may be provided, in order to not incurr in more complexity to support an arbitrary
+        // may be provided, in order to not incur in more complexity to support an arbitrary
         // amount of headers we chose a conservative amount and error otherwise
         // https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob?tabs=microsoft-entra-id#response-headers
         let mut headers = [httparse::EMPTY_HEADER; 48];
@@ -506,16 +665,50 @@ async fn parse_blob_batch_delete_body(
     Ok(results)
 }
 
+/// How long a freshly fetched user delegation key is requested to remain valid.
+///
+/// The shared access signature (SAS) tokens we sign with it stay short-lived;
+/// this only bounds how often we call `GetUserDelegationKey`. Azure caps the key
+/// lifetime at 7 days (the `Start` and `Expiry` of the key must be within seven
+/// days of each other):
+/// <https://learn.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key#request-body>
+const DELEGATION_KEY_VALIDITY: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Minimum remaining validity for a cached key to be reused.
+///
+/// The cache only hands back a key with at least this much life left, so it is
+/// also the longest SAS lifetime the cache can safely serve (a SAS must not
+/// outlive the key it is signed with). Longer-lived SAS fetch a dedicated key.
+const DELEGATION_KEY_MIN_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Parse the validity Azure actually granted a user delegation key, falling back
+/// to the window we requested if the response can't be parsed.
+fn delegation_key_expiry(key: &UserDelegationKey, requested: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&key.signed_expiry)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(requested)
+}
+
 #[derive(Debug)]
 pub(crate) struct AzureClient {
     config: AzureConfig,
     client: HttpClient,
+    /// Caches the user delegation key used to sign SAS URLs.
+    ///
+    /// Fetching a key is a network round-trip (`GetUserDelegationKey`) that Azure
+    /// throttles under load, so we fetch a long-lived key once and reuse it to
+    /// mint many short-lived SAS tokens.
+    delegation_key_cache: TokenCache<UserDelegationKey>,
 }
 
 impl AzureClient {
     /// create a new instance of [AzureClient]
     pub(crate) fn new(config: AzureConfig, client: HttpClient) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            delegation_key_cache: TokenCache::default().with_min_ttl(DELEGATION_KEY_MIN_TTL),
+        }
     }
 
     /// Returns the config
@@ -525,6 +718,10 @@ impl AzureClient {
 
     async fn get_credential(&self) -> Result<Option<Arc<AzureCredential>>> {
         self.config.get_credential().await
+    }
+
+    pub(crate) fn crypto(&self) -> Option<&dyn CryptoProvider> {
+        self.config.crypto.as_deref()
     }
 
     fn put_request<'a>(&'a self, path: &'a Path, payload: PutPayload) -> PutRequest<'a> {
@@ -569,21 +766,36 @@ impl AzureClient {
             }
         };
 
-        let response = builder.header(&BLOB_TYPE, "BlockBlob").send().await?;
-        Ok(get_put_result(response.headers(), VERSION_HEADER)
-            .map_err(|source| Error::Metadata { source })?)
+        // based on https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage, azure
+        // responds with `Precondition` when any put with a precondition fails, but we promise to
+        // return `AlreadyExists` when that put mode is `Create`.
+        let response = match (builder.header(&BLOB_TYPE, "BlockBlob").send().await, mode) {
+            (Err(crate::Error::Precondition { path, source }), PutMode::Create) => {
+                return Err(crate::Error::AlreadyExists { path, source });
+            }
+            (r, _) => r?,
+        };
+
+        Ok(
+            get_put_result(response, VERSION_HEADER)
+                .map_err(|source| Error::Metadata { source })?,
+        )
+    }
+
+    /// Generate the identity of a block in a multipart upload
+    pub(crate) fn new_block_id() -> String {
+        let block_id = u128::from_be_bytes(rand::rng().random());
+        format!("{block_id:032x}")
     }
 
     /// PUT a block <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block>
     pub(crate) async fn put_block(
         &self,
         path: &Path,
-        _part_idx: usize,
+        content_id: &str,
         payload: PutPayload,
     ) -> Result<PartId> {
-        let part_idx = u128::from_be_bytes(rand::rng().random());
-        let content_id = format!("{part_idx:032x}");
-        let block_id = BASE64_STANDARD.encode(&content_id);
+        let block_id = BASE64_STANDARD.encode(content_id);
 
         self.put_request(path, payload)
             .query(&[("comp", "block"), ("blockid", &block_id)])
@@ -591,7 +803,9 @@ impl AzureClient {
             .send()
             .await?;
 
-        Ok(PartId { content_id })
+        Ok(PartId {
+            content_id: content_id.into(),
+        })
     }
 
     /// PUT a block list <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-list>
@@ -623,38 +837,10 @@ impl AzureClient {
             .send()
             .await?;
 
-        Ok(get_put_result(response.headers(), VERSION_HEADER)
-            .map_err(|source| Error::Metadata { source })?)
-    }
-
-    /// Make an Azure Delete request <https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob>
-    pub(crate) async fn delete_request<T: Serialize + ?Sized + Sync>(
-        &self,
-        path: &Path,
-        query: &T,
-    ) -> Result<()> {
-        let credential = self.get_credential().await?;
-        let url = self.config.path_url(path);
-
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
-        self.client
-            .delete(url.as_str())
-            .query(query)
-            .header(&DELETE_SNAPSHOTS, "include")
-            .with_azure_authorization(&credential, &self.config.account)
-            .retryable(&self.config.retry_config)
-            .sensitive(sensitive)
-            .send()
-            .await
-            .map_err(|source| {
-                let path = path.as_ref().into();
-                Error::DeleteRequest { source, path }
-            })?;
-
-        Ok(())
+        Ok(
+            get_put_result(response, VERSION_HEADER)
+                .map_err(|source| Error::Metadata { source })?,
+        )
     }
 
     fn build_bulk_delete_body(
@@ -662,13 +848,16 @@ impl AzureClient {
         boundary: &str,
         paths: &[Path],
         credential: &Option<Arc<AzureCredential>>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
+        let crypto = self.crypto();
         let mut body_bytes = Vec::with_capacity(paths.len() * 2048);
 
         for (idx, path) in paths.iter().enumerate() {
             let url = self.config.path_url(path);
 
             // Build subrequest with proper authorization
+            // Note: Delete operations don't require us to pass customer provided keys
+            // https://learn.microsoft.com/en-us/azure/storage/blobs/encryption-customer-provided-keys#blob-storage-operations-supporting-customer-provided-keys
             let request = self
                 .client
                 .delete(url.as_str())
@@ -676,7 +865,7 @@ impl AzureClient {
                 // Each subrequest must be authorized individually [1] and we use
                 // the CredentialExt for this.
                 // [1]: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch?tabs=microsoft-entra-id#request-body
-                .with_azure_authorization(credential, &self.config.account)
+                .with_azure_authorization(crypto, credential, &self.config.account)?
                 .into_parts()
                 .1
                 .unwrap();
@@ -694,7 +883,7 @@ impl AzureClient {
         extend(&mut body_bytes, boundary.as_bytes());
         extend(&mut body_bytes, b"--");
         extend(&mut body_bytes, b"\r\n");
-        body_bytes
+        Ok(body_bytes)
     }
 
     pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
@@ -708,10 +897,11 @@ impl AzureClient {
         let random_bytes = rand::random::<[u8; 16]>(); // 128 bits
         let boundary = format!("batch_{}", BASE64_STANDARD_NO_PAD.encode(random_bytes));
 
-        let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential);
+        let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential)?;
 
         // Send multipart request
         let url = self.config.path_url(&Path::from("/"));
+        let sensitive = self.config.is_sensitive(&credential);
         let batch_response = self
             .client
             .post(url.as_str())
@@ -723,8 +913,10 @@ impl AzureClient {
             )
             .header(CONTENT_LENGTH, HeaderValue::from(body_bytes.len()))
             .body(body_bytes)
-            .with_azure_authorization(&credential, &self.config.account)
-            .send_retry(&self.config.retry_config)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
+            .retryable(&self.config.retry_config)
+            .sensitive(sensitive)
+            .send()
             .await
             .map_err(|source| Error::BulkDeleteRequest { source })?;
 
@@ -741,11 +933,21 @@ impl AzureClient {
         Ok(results)
     }
 
-    /// Make an Azure Copy request <https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob>
+    /// Make an Azure copy request <https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob>.
+    ///
+    /// The classic `Copy Blob` API does not accept CPK headers, so when
+    /// customer-provided keys are enabled this falls back to
+    /// [Put Blob From URL][put-blob-from-url] and opts into the service version
+    /// that added source CPK headers. That changes the semantics: the operation
+    /// is synchronous, the source must be a block blob no larger than 5,000 MiB,
+    /// and uncommitted blocks / the source block list are not preserved.
+    ///
+    /// [put-blob-from-url]: https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob-from-url
     pub(crate) async fn copy_request(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
         let credential = self.get_credential().await?;
         let url = self.config.path_url(to);
         let mut source = self.config.path_url(from);
+        let mut source_authorization = None;
 
         // If using SAS authorization must include the headers in the URL
         // <https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob#request-headers>
@@ -753,22 +955,57 @@ impl AzureClient {
             source.query_pairs_mut().extend_pairs(pairs);
         }
 
+        if self.config.encryption_headers.is_enabled() {
+            match credential.as_deref() {
+                Some(AzureCredential::AccessKey(key)) => {
+                    let signed_start = Utc::now();
+                    let signed_expiry = signed_start + COPY_SOURCE_SAS_EXPIRES_IN;
+                    AzureSigner::new(
+                        key.clone(),
+                        self.config.account.clone(),
+                        signed_start,
+                        signed_expiry,
+                        None,
+                    )
+                    .sign(
+                        crypto_provider(self.crypto())?,
+                        &Method::GET,
+                        &mut source,
+                    )?;
+                }
+                Some(AzureCredential::BearerToken(token)) => {
+                    source_authorization = Some(format!("Bearer {token}"));
+                }
+                _ => {}
+            }
+        }
+
         let mut builder = self
             .client
             .request(Method::PUT, url.as_str())
-            .header(&COPY_SOURCE, source.to_string())
             .header(CONTENT_LENGTH, HeaderValue::from_static("0"));
+
+        builder = builder.sensitive_header(&COPY_SOURCE, source.to_string());
+
+        if self.config.encryption_headers.is_enabled() {
+            builder = builder
+                .header(&BLOB_TYPE, "BlockBlob")
+                .with_azure_encryption_headers(&self.config.encryption_headers)
+                .with_azure_source_encryption_headers(&self.config.encryption_headers)
+                .with_azure_version(PUT_BLOB_FROM_URL_SOURCE_CPK_VERSION);
+        }
+
+        if let Some(source_authorization) = source_authorization {
+            builder = builder.sensitive_header(&COPY_SOURCE_AUTHORIZATION, source_authorization);
+        }
 
         if !overwrite {
             builder = builder.header(IF_NONE_MATCH, "*");
         }
 
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
         builder
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(overwrite)
@@ -781,7 +1018,7 @@ impl AzureClient {
 
     /// Make a Get User Delegation Key request
     /// <https://docs.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key>
-    async fn get_user_delegation_key(
+    async fn get_delegation_key_inner(
         &self,
         start: &DateTime<Utc>,
         end: &DateTime<Utc>,
@@ -799,17 +1036,14 @@ impl AzureClient {
         ));
         body.push_str("</KeyInfo>");
 
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
 
         let response = self
             .client
             .post(url.as_str())
             .body(body)
             .query(&[("restype", "service"), ("comp", "userdelegationkey")])
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(true)
@@ -830,7 +1064,7 @@ impl AzureClient {
     /// Creat an AzureSigner for generating SAS tokens (pre-signed urls).
     ///
     /// Depending on the type of credential, this will either use the account key or a user delegation key.
-    /// Since delegation keys are acquired ad-hoc, the signer aloows for signing multiple urls with the same key.
+    /// Since delegation keys are acquired ad-hoc, the signer allows for signing multiple urls with the same key.
     pub(crate) async fn signer(&self, expires_in: Duration) -> Result<AzureSigner> {
         let credential = self.get_credential().await?;
         let signed_start = chrono::Utc::now();
@@ -838,7 +1072,7 @@ impl AzureClient {
         match credential.as_deref() {
             Some(AzureCredential::BearerToken(_)) => {
                 let key = self
-                    .get_user_delegation_key(&signed_start, &signed_expiry)
+                    .user_delegation_key(signed_start, signed_expiry, expires_in)
                     .await?;
                 let signing_key = AzureAccessKey::try_new(&key.value)?;
                 Ok(AzureSigner::new(
@@ -861,19 +1095,62 @@ impl AzureClient {
         }
     }
 
+    /// Return a user delegation key valid for a SAS over `[sas_start, sas_expiry]`.
+    ///
+    /// `GetUserDelegationKey` is a network round-trip that Azure throttles (HTTP
+    /// 503) under load, so a long-lived key is cached and reused to sign many
+    /// short-lived SAS URLs.
+    ///
+    /// The cache only returns a key with more than [`DELEGATION_KEY_MIN_TTL`]
+    /// remaining, so any SAS no longer than that is guaranteed to expire before
+    /// its key. The (rare) longer-lived SAS get a dedicated key instead.
+    async fn user_delegation_key(
+        &self,
+        sas_start: DateTime<Utc>,
+        sas_expiry: DateTime<Utc>,
+        expires_in: Duration,
+    ) -> Result<UserDelegationKey> {
+        if expires_in <= DELEGATION_KEY_MIN_TTL {
+            self.delegation_key_cache
+                .get_or_insert_with(|| self.get_delegation_key(DELEGATION_KEY_VALIDITY))
+                .await
+        } else {
+            self.get_delegation_key_inner(&sas_start, &sas_expiry).await
+        }
+    }
+
+    /// Fetch a user delegation key valid for `validity` and wrap it as a
+    /// [`TemporaryToken`] so [`TokenCache`] can expire it.
+    async fn get_delegation_key(
+        &self,
+        validity: Duration,
+    ) -> Result<TemporaryToken<UserDelegationKey>> {
+        let start = chrono::Utc::now();
+        let requested_expiry = start + validity;
+        let key = self
+            .get_delegation_key_inner(&start, &requested_expiry)
+            .await?;
+        // Expire the cache entry when the key Azure granted does (it may clamp it).
+        let expiry = delegation_key_expiry(&key, requested_expiry);
+        let ttl = (expiry - chrono::Utc::now()).to_std().unwrap_or(validity);
+        Ok(TemporaryToken {
+            token: key,
+            expiry: Some(Instant::now() + ttl),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn get_blob_tagging(&self, path: &Path) -> Result<HttpResponse> {
         let credential = self.get_credential().await?;
         let url = self.config.path_url(path);
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
+        // Note: Get blob tags doesn't require us to pass customer provided keys
+        // https://learn.microsoft.com/en-us/azure/storage/blobs/encryption-customer-provided-keys#blob-storage-operations-supporting-customer-provided-keys
         let response = self
             .client
             .get(url.as_str())
             .query(&[("comp", "tags")])
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .send()
@@ -932,18 +1209,17 @@ impl GetClient for AzureClient {
             .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
             .body(Bytes::new());
 
+        builder = builder.with_azure_encryption_headers(&self.config.encryption_headers);
+
         if let Some(v) = &options.version {
             builder = builder.query(&[("versionid", v)])
         }
 
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
 
         let response = builder
             .with_get_options(options)
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable_request()
             .sensitive(sensitive)
             .send(ctx)
@@ -975,16 +1251,13 @@ impl ListClient for Arc<AzureClient> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        if opts.offset.is_some() {
-            return Err(crate::Error::NotSupported {
-                source: "Azure does not support listing with offsets".into(),
-            });
-        }
-
         let credential = self.get_credential().await?;
         let url = self.config.path_url(&Path::default());
 
-        let mut query = Vec::with_capacity(5);
+        // Read before `opts.extensions` is moved into the request builder
+        let invalid_key_handling = opts.invalid_keys;
+
+        let mut query = Vec::with_capacity(6);
         query.push(("restype", "container"));
         query.push(("comp", "list"));
 
@@ -998,6 +1271,10 @@ impl ListClient for Arc<AzureClient> {
 
         if let Some(token) = &opts.page_token {
             query.push(("marker", token.as_ref()))
+        } else if let Some(offset) = &opts.offset {
+            // startFrom is only used on the first request, subsequent requests use marker
+            // Note: startFrom is inclusive (unlike S3/GCP's start-after which is exclusive)
+            query.push(("startFrom", offset.as_ref()))
         }
 
         let max_keys_str;
@@ -1006,23 +1283,26 @@ impl ListClient for Arc<AzureClient> {
             query.push(("maxresults", max_keys_str.as_ref()))
         }
 
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
+        let sensitive = self.config.is_sensitive(&credential);
 
         let response = self
             .client
             .get(url.as_str())
             .extensions(opts.extensions)
             .query(&query)
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .send()
             .await
-            .map_err(|source| Error::ListRequest { source })?
-            .into_body()
+            .map_err(|source| Error::ListRequest {
+                source,
+                path: prefix.unwrap_or_default().to_string(),
+            })?;
+
+        let (parts, body) = response.into_parts();
+
+        let response = body
             .bytes()
             .await
             .map_err(|source| Error::ListResponseBody { source })?;
@@ -1032,9 +1312,26 @@ impl ListClient for Arc<AzureClient> {
 
         let token = response.next_marker.take().filter(|x| !x.is_empty());
 
+        // Azure's startFrom is inclusive, so when an offset is provided, we need to filter out
+        // the offset item itself to match the exclusive semantics expected by ObjectStore::list_with_offset.
+        // Since Azure returns items in lexicographic order and startFrom is inclusive, the first item
+        // (if any) will be exactly == offset (if it exists), or > offset (if it doesn't exist).
+        // So we can efficiently remove just the first item if it equals the offset.
+        if let Some(offset) = &opts.offset {
+            if let Some(first) = response.blobs.blobs.first() {
+                if first.name == *offset {
+                    response.blobs.blobs.remove(0);
+                }
+            }
+        }
+
+        let (mut result, invalid_keys) = to_list_result(response, prefix, invalid_key_handling)?;
+        result.extensions = parts.extensions;
+
         Ok(PaginatedListResult {
-            result: to_list_result(response, prefix)?,
+            result,
             page_token: token,
+            invalid_keys,
         })
     }
 }
@@ -1050,13 +1347,21 @@ struct ListResultInternal {
     pub blobs: Blobs,
 }
 
-fn to_list_result(value: ListResultInternal, prefix: Option<&str>) -> Result<ListResult> {
+/// Converts a list response into a [`ListResult`], along with the entries omitted
+/// from it under [`InvalidKeyHandling::Skip`]
+fn to_list_result(
+    value: ListResultInternal,
+    prefix: Option<&str>,
+    handling: InvalidKeyHandling,
+) -> Result<(ListResult, Vec<InvalidKey>)> {
     let prefix = prefix.unwrap_or_default();
+    let mut invalid_keys = Vec::new();
+
     let common_prefixes = value
         .blobs
         .blob_prefix
         .into_iter()
-        .map(|x| Ok(Path::parse(x.name)?))
+        .filter_map(|x| parse_key(x.name, handling, &mut invalid_keys).transpose())
         .collect::<Result<_>>()?;
 
     let objects = value
@@ -1066,17 +1371,24 @@ fn to_list_result(value: ListResultInternal, prefix: Option<&str>) -> Result<Lis
         // Note: Filters out directories from list results when hierarchical namespaces are
         // enabled. When we want directories, its always via the BlobPrefix mechanics,
         // and during lists we state that prefixes are evaluated on path segment basis.
+        //
+        // Note: this filter runs ahead of key parsing so that filtered blobs are never
+        // reported as invalid keys.
         .filter(|blob| {
             !matches!(blob.properties.resource_type.as_ref(), Some(typ) if typ == "directory")
                 && blob.name.len() > prefix.len()
         })
-        .map(ObjectMeta::try_from)
+        .filter_map(|x| to_object_meta(x, handling, &mut invalid_keys).transpose())
         .collect::<Result<_>>()?;
 
-    Ok(ListResult {
-        common_prefixes,
-        objects,
-    })
+    Ok((
+        ListResult {
+            common_prefixes,
+            objects,
+            extensions: Default::default(),
+        },
+        invalid_keys,
+    ))
 }
 
 /// Collection of blobs and potentially shared prefixes returned from list requests.
@@ -1108,18 +1420,23 @@ struct Blob {
     pub metadata: Option<HashMap<String, String>>,
 }
 
-impl TryFrom<Blob> for ObjectMeta {
-    type Error = crate::Error;
+/// Returns `Ok(None)` if the blob's name was skipped, see [`parse_key`]
+fn to_object_meta(
+    value: Blob,
+    handling: InvalidKeyHandling,
+    invalid_keys: &mut Vec<InvalidKey>,
+) -> Result<Option<ObjectMeta>> {
+    let Some(location) = parse_key(value.name, handling, invalid_keys)? else {
+        return Ok(None);
+    };
 
-    fn try_from(value: Blob) -> Result<Self> {
-        Ok(Self {
-            location: Path::parse(value.name)?,
-            last_modified: value.properties.last_modified,
-            size: value.properties.content_length,
-            e_tag: value.properties.e_tag,
-            version: None, // For consistency with S3 and GCP which don't include this
-        })
-    }
+    Ok(Some(ObjectMeta {
+        location,
+        last_modified: value.properties.last_modified,
+        size: value.properties.content_length,
+        e_tag: value.properties.e_tag,
+        version: None, // For consistency with S3 and GCP which don't include this
+    }))
 }
 
 /// Properties associated with individual blobs. The actual list
@@ -1190,7 +1507,7 @@ impl BlockList {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct UserDelegationKey {
     pub signed_oid: String,
@@ -1202,13 +1519,38 @@ pub(crate) struct UserDelegationKey {
     pub value: String,
 }
 
+impl std::fmt::Debug for UserDelegationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            signed_oid,
+            signed_tid,
+            signed_start,
+            signed_expiry,
+            signed_service,
+            signed_version,
+            value: _, // secret => redacted
+        } = self;
+        f.debug_struct("UserDelegationKey")
+            .field("signed_oid", signed_oid)
+            .field("signed_tid", signed_tid)
+            .field("signed_start", signed_start)
+            .field("signed_expiry", signed_expiry)
+            .field("signed_service", signed_service)
+            .field("signed_version", signed_version)
+            .field("value", &"******")
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectStoreExt;
     use crate::StaticCredentialProvider;
     use bytes::Bytes;
     use regex::bytes::Regex;
     use reqwest::Client;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn deserde_azure() {
@@ -1290,8 +1632,7 @@ mod tests {
     <NextMarker />
 </EnumerationResults>";
 
-        let mut _list_blobs_response_internal: ListResultInternal =
-            quick_xml::de::from_str(S).unwrap();
+        let _list_blobs_response_internal: ListResultInternal = quick_xml::de::from_str(S).unwrap();
     }
 
     #[test]
@@ -1364,6 +1705,199 @@ mod tests {
         let _list_blobs_response_internal: ListResultInternal = quick_xml::de::from_str(S).unwrap();
     }
 
+    /// A page mixing representable names with ones `Path` cannot represent: an empty
+    /// segment, a relative segment, an ASCII control character, and a leading `/`
+    /// (which `Path::parse` would strip). A trailing `/` is normalized, not rejected.
+    /// `BlobPrefix` holds one of each kind too, and a hierarchical-namespace directory
+    /// blob is present to confirm it is filtered rather than reported as invalid.
+    const INVALID_KEY_LIST_RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<EnumerationResults>
+    <Prefix>logs/</Prefix>
+    <Delimiter>/</Delimiter>
+    <Blobs>
+        <BlobPrefix>
+            <Name>logs/good/</Name>
+        </BlobPrefix>
+        <BlobPrefix>
+            <Name>bad//prefix/</Name>
+        </BlobPrefix>
+        <Blob>
+            <Name>logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Etag>0x8D93C7D4629C227</Etag>
+                <Content-Length>100</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs//b.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>200</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/../c.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>300</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/d\u{7}.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>400</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>500</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs/sub/</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>0</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+        <Blob>
+            <Name>logs//dir</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>0</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+                <ResourceType>directory</ResourceType>
+            </Properties>
+        </Blob>
+    </Blobs>
+    <NextMarker>marker-abc</NextMarker>
+</EnumerationResults>";
+
+    fn parse_invalid_key_list_response() -> ListResultInternal {
+        quick_xml::de::from_str(INVALID_KEY_LIST_RESPONSE).unwrap()
+    }
+
+    #[test]
+    fn list_result_error_on_invalid_key() {
+        let response = parse_invalid_key_list_response();
+        let err = to_list_result(response, Some("logs/"), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_result_skip_invalid_key() {
+        let response = parse_invalid_key_list_response();
+        let token = response.next_marker.clone();
+
+        let (result, invalid_keys) =
+            to_list_result(response, Some("logs/"), InvalidKeyHandling::Skip).unwrap();
+
+        // The continuation token survives a page that skipped entries
+        assert_eq!(token.as_deref(), Some("marker-abc"));
+
+        // A trailing `/` is still normalized away rather than reported invalid
+        let objects: Vec<_> = result.objects.iter().map(|x| x.location.as_ref()).collect();
+        assert_eq!(objects, vec!["logs/a.mcap", "logs/sub"]);
+        assert_eq!(result.objects[0].size, 100);
+        assert_eq!(
+            result.objects[0].e_tag.as_deref(),
+            Some("0x8D93C7D4629C227")
+        );
+
+        let prefixes: Vec<_> = result.common_prefixes.iter().map(|x| x.as_ref()).collect();
+        assert_eq!(prefixes, vec!["logs/good"]);
+
+        // Raw names are reported verbatim, prefixes ahead of objects. `logs//dir` is
+        // filtered as a directory before parsing, so it is absent despite being invalid.
+        let keys: Vec<_> = invalid_keys.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "bad//prefix/",
+                "logs//b.mcap",
+                "logs/../c.mcap",
+                "logs/d\u{7}.mcap",
+                "/logs/a.mcap",
+            ]
+        );
+
+        // The leading-slash name is reported as non-normalizable, not as a parse failure
+        let source = &invalid_keys.last().unwrap().source;
+        assert!(
+            matches!(source, crate::path::Error::NotNormalized { path } if path == "/logs/a.mcap"),
+            "unexpected source: {source}"
+        );
+    }
+
+    /// A leading `/` alone is enough to fail the page under [`InvalidKeyHandling::Error`]
+    #[test]
+    fn list_result_error_on_non_normalized_key() {
+        const RESPONSE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<EnumerationResults>
+    <Prefix>logs/</Prefix>
+    <Blobs>
+        <Blob>
+            <Name>/logs/a.mcap</Name>
+            <Properties>
+                <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>
+                <Content-Length>100</Content-Length>
+                <Content-Type>text/plain</Content-Type>
+            </Properties>
+        </Blob>
+    </Blobs>
+</EnumerationResults>";
+
+        let response: ListResultInternal = quick_xml::de::from_str(RESPONSE).unwrap();
+        let err = to_list_result(response, Some("logs/"), InvalidKeyHandling::Error).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A failed list request must be classified by status, not flattened into `Generic`
+    #[test]
+    fn list_request_error_is_typed() {
+        use crate::client::retry::RetryError;
+        use http::StatusCode;
+
+        let classify = |status| {
+            let source = RetryError::from_status(status);
+            let path = "logs/".to_string();
+            crate::Error::from(Error::ListRequest { source, path })
+        };
+
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN),
+            crate::Error::PermissionDenied { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED),
+            crate::Error::Unauthenticated { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::NOT_FOUND),
+            crate::Error::NotFound { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            crate::Error::Generic { .. }
+        ));
+    }
+
     #[test]
     fn to_xml() {
         const S: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -1399,6 +1933,140 @@ mod tests {
             quick_xml::de::from_str(S).unwrap();
     }
 
+    #[test]
+    fn test_delegation_key_expiry() {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let requested = at("2026-06-25T06:00:00Z");
+
+        // A well-formed granted expiry is honored (e.g. Azure clamped it shorter).
+        let key = UserDelegationKey {
+            signed_expiry: "2026-06-25T05:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delegation_key_expiry(&key, requested),
+            at("2026-06-25T05:00:00Z")
+        );
+
+        // An unparsable expiry falls back to the requested window.
+        let key = UserDelegationKey {
+            signed_expiry: "not a timestamp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(delegation_key_expiry(&key, requested), requested);
+    }
+
+    #[cfg(feature = "reqwest")]
+    fn test_client(service: &str) -> AzureClient {
+        let credential_provider = Arc::new(StaticCredentialProvider::new(
+            AzureCredential::BearerToken("static-token".to_string()),
+        ));
+
+        let config = AzureConfig {
+            account: "testaccount".to_string(),
+            container: "testcontainer".to_string(),
+            credentials: credential_provider,
+            crypto: None,
+            service: service.try_into().unwrap(),
+            retry_config: Default::default(),
+            is_emulator: false,
+            skip_signature: false,
+            disable_tagging: false,
+            client_options: Default::default(),
+            encryption_headers: Default::default(),
+        };
+
+        AzureClient::new(config, HttpClient::new(Client::new()))
+    }
+
+    fn delegation_key_response(expiry: DateTime<Utc>) -> String {
+        let expiry = expiry.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<UserDelegationKey>
+    <SignedOid>oid</SignedOid>
+    <SignedTid>tid</SignedTid>
+    <SignedStart>2026-06-25T00:00:00Z</SignedStart>
+    <SignedExpiry>{expiry}</SignedExpiry>
+    <SignedService>b</SignedService>
+    <SignedVersion>2025-11-05</SignedVersion>
+    <Value>secret</Value>
+</UserDelegationKey>"#
+        )
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_user_delegation_key_cache_reuse_and_refresh() {
+        let now = Utc::now();
+        let one_min = Duration::from_secs(60);
+        let three_hours = Duration::from_secs(3 * 60 * 60);
+
+        // A key with more than DELEGATION_KEY_MIN_TTL remaining should be reused
+        // for short-lived SAS tokens instead of triggering another
+        // GetUserDelegationKey request.
+        let server = crate::client::mock_server::MockServer::new().await;
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let client = test_client(server.url());
+
+        let fetches_clone = Arc::clone(&fetches);
+        server.push_fn(move |_| {
+            fetches_clone.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(delegation_key_response(now + three_hours))
+        });
+
+        client
+            .user_delegation_key(now, now + one_min, one_min)
+            .await
+            .unwrap();
+        client
+            .user_delegation_key(now, now + one_min, one_min)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        // SAS tokens longer than DELEGATION_KEY_MIN_TTL are not safe to mint
+        // with the cached key, so they fetch a dedicated delegation key.
+        let fetches_clone = Arc::clone(&fetches);
+        server.push_fn(move |_| {
+            fetches_clone.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(delegation_key_response(now + three_hours))
+        });
+
+        client
+            .user_delegation_key(now, now + three_hours, three_hours)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+
+        // A newly fetched key whose Azure-granted expiry is already below
+        // DELEGATION_KEY_MIN_TTL is cached, but should be refreshed after the
+        // TokenCache fetch backoff instead of being reused indefinitely.
+        let server = crate::client::mock_server::MockServer::new().await;
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let client = test_client(server.url());
+
+        for _ in 0..2 {
+            let fetches_clone = Arc::clone(&fetches);
+            server.push_fn(move |_| {
+                fetches_clone.fetch_add(1, Ordering::SeqCst);
+                http::Response::new(delegation_key_response(now + one_min))
+            });
+        }
+
+        client
+            .user_delegation_key(now, now + one_min, one_min)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client
+            .user_delegation_key(now, now + one_min, one_min)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_build_bulk_delete_body() {
         let credential_provider = Arc::new(StaticCredentialProvider::new(
@@ -1409,12 +2077,18 @@ mod tests {
             account: "testaccount".to_string(),
             container: "testcontainer".to_string(),
             credentials: credential_provider,
+            crypto: None,
             service: "http://example.com".try_into().unwrap(),
             retry_config: Default::default(),
             is_emulator: false,
             skip_signature: false,
             disable_tagging: false,
             client_options: Default::default(),
+            encryption_headers: AzureEncryptionHeaders::try_new(
+                None,
+                Some(BASE64_STANDARD.encode([7_u8; 32])),
+            )
+            .unwrap(),
         };
 
         let client = AzureClient::new(config, HttpClient::new(Client::new()));
@@ -1424,7 +2098,9 @@ mod tests {
 
         let boundary = "batch_statictestboundary".to_string();
 
-        let body_bytes = client.build_bulk_delete_body(&boundary, paths, &credential);
+        let body_bytes = client
+            .build_bulk_delete_body(&boundary, paths, &credential)
+            .unwrap();
 
         // Replace Date header value with a static date
         let re = Regex::new("Date:[^\r]+").unwrap();
@@ -1472,6 +2148,370 @@ Authorization: Bearer static-token\r
             .to_vec();
 
         assert_eq!(expected_body, body_bytes);
+    }
+
+    #[test]
+    fn test_azure_encryption_headers_debug_redacts_key() {
+        let encryption_key = BASE64_STANDARD.encode([7_u8; 32]);
+        let headers = AzureEncryptionHeaders::try_new(None, Some(encryption_key.clone())).unwrap();
+        let encryption_key_sha256 = headers.encryption_key_sha256.clone().unwrap();
+
+        let debug = format!("{headers:?}");
+
+        assert!(!debug.contains(&encryption_key));
+        assert!(!debug.contains(&encryption_key_sha256));
+        assert!(debug.contains("key_configured: true"));
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn test_azure_sensitive_headers_redact_client_request_debug() {
+        let encryption_key = BASE64_STANDARD.encode([7_u8; 32]);
+        let headers = AzureEncryptionHeaders::try_new(None, Some(encryption_key.clone())).unwrap();
+        let encryption_key_sha256 = headers.encryption_key_sha256.clone().unwrap();
+        let copy_source = "http://example.com/source.txt?sig=secret-source-sas";
+        let source_authorization = "Bearer static-token";
+
+        let request = HttpClient::new(Client::new())
+            .request(Method::PUT, "http://example.com/dest.txt")
+            .with_azure_encryption_headers(&headers)
+            .with_azure_source_encryption_headers(&headers)
+            .sensitive_header(&COPY_SOURCE, copy_source)
+            .sensitive_header(&COPY_SOURCE_AUTHORIZATION, source_authorization)
+            .into_parts()
+            .1
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-ms-encryption-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            encryption_key
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-ms-source-encryption-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            encryption_key
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-ms-copy-source")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            copy_source
+        );
+
+        let debug = format!("{:?}", request.headers());
+        assert!(!debug.contains(&encryption_key));
+        assert!(!debug.contains(&encryption_key_sha256));
+        assert!(!debug.contains(copy_source));
+        assert!(!debug.contains(source_authorization));
+        assert!(debug.contains("Sensitive"));
+    }
+
+    #[tokio::test]
+    async fn test_get_request_includes_encryption_headers() {
+        let server = crate::client::mock_server::MockServer::new().await;
+
+        let store = crate::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_access_key("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+            .with_allow_http(true)
+            .with_endpoint(server.url().to_string())
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 32]))
+            .build()
+            .unwrap();
+
+        server.push_fn(|req| {
+            assert_eq!(req.method(), Method::GET);
+            assert_eq!(
+                req.headers().get("range").unwrap().to_str().unwrap(),
+                "bytes=1-3"
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-key-sha256")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "S7Bvjk46dxXSAdVz0KpCN2LlXavWGiwCJ4+lbMbSlOA="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-algorithm")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "AES256"
+            );
+
+            http::Response::builder()
+                .status(206)
+                .header("content-length", "3")
+                .header("content-range", "bytes 1-3/5")
+                .header("etag", "test-etag")
+                .header("last-modified", "Tue, 05 Nov 2024 15:01:15 GMT")
+                .body("ell".to_string())
+                .unwrap()
+        });
+
+        let bytes = store
+            .get_range(&Path::from("file.txt"), 1..4)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"ell"));
+    }
+
+    #[tokio::test]
+    async fn test_copy_request_includes_encryption_headers() {
+        let server = crate::client::mock_server::MockServer::new().await;
+        let endpoint = server.url().to_string();
+        let expected_source = format!("{endpoint}/testcontainer/source.txt");
+
+        let store = crate::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_access_key("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+            .with_allow_http(true)
+            .with_endpoint(endpoint)
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 32]))
+            .build()
+            .unwrap();
+
+        server.push_fn(move |req| {
+            assert_eq!(req.method(), Method::PUT);
+            let copy_source = req
+                .headers()
+                .get("x-ms-copy-source")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let mut parsed_source = Url::parse(copy_source).unwrap();
+            let query: HashMap<_, _> = parsed_source.query_pairs().into_owned().collect();
+            parsed_source.set_query(None);
+            assert_eq!(parsed_source.to_string(), expected_source);
+            assert_eq!(query.get("sp").map(String::as_str), Some("r"));
+            assert_eq!(query.get("sr").map(String::as_str), Some("b"));
+            assert!(query.contains_key("sig"));
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-source-encryption-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-source-encryption-key-sha256")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "S7Bvjk46dxXSAdVz0KpCN2LlXavWGiwCJ4+lbMbSlOA="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-source-encryption-algorithm")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "AES256"
+            );
+            assert_eq!(
+                req.headers().get("x-ms-version").unwrap().to_str().unwrap(),
+                "2026-02-06"
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-blob-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BlockBlob"
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-key-sha256")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "S7Bvjk46dxXSAdVz0KpCN2LlXavWGiwCJ4+lbMbSlOA="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-algorithm")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "AES256"
+            );
+
+            http::Response::builder()
+                .status(201)
+                .body(String::new())
+                .unwrap()
+        });
+
+        store
+            .copy(&Path::from("source.txt"), &Path::from("dest.txt"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_copy_request_uses_source_authorization_for_bearer_cpk() {
+        let server = crate::client::mock_server::MockServer::new().await;
+        let endpoint = server.url().to_string();
+        let expected_source = format!("{endpoint}/testcontainer/source.txt");
+
+        let store = crate::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_bearer_token_authorization("static-token")
+            .with_allow_http(true)
+            .with_endpoint(endpoint)
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 32]))
+            .build()
+            .unwrap();
+
+        server.push_fn(move |req| {
+            assert_eq!(req.method(), Method::PUT);
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-copy-source")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                expected_source
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-copy-source-authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer static-token"
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-source-encryption-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            );
+            assert_eq!(
+                req.headers()
+                    .get("x-ms-encryption-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            );
+
+            http::Response::builder()
+                .status(201)
+                .body(String::new())
+                .unwrap()
+        });
+
+        store
+            .copy(&Path::from("source.txt"), &Path::from("dest.txt"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cpk_errors_redact_request_url() {
+        let server = crate::client::mock_server::MockServer::new().await;
+        let endpoint = server.url().to_string();
+
+        let store = crate::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_access_key("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+            .with_allow_http(true)
+            .with_endpoint(endpoint.clone())
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 32]))
+            .build()
+            .unwrap();
+
+        server.push_fn(|_req| {
+            http::Response::builder()
+                .status(409)
+                .body(String::from("conflict"))
+                .unwrap()
+        });
+
+        let err = store
+            .get_range(&Path::from("file.txt"), 0..1)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("REDACTED"), "{msg}");
+        assert!(!msg.contains(&endpoint), "{msg}");
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_put_mode_create_translates_precondition_to_already_exists() {
+        let server = crate::client::mock_server::MockServer::new().await;
+        let client = test_client(server.url());
+        let update = PutMode::Update(crate::UpdateVersion {
+            e_tag: Some("\"etag\"".to_string()),
+            version: None,
+        });
+
+        // Real Azure reports a failed put precondition as `412 Precondition Failed`,
+        // Azurite as `409 Conflict`; both must surface as `AlreadyExists` for
+        // `PutMode::Create`, while `PutMode::Update` failures remain `Precondition`
+        for (status, mode, want_already_exists) in [
+            (412, PutMode::Create, true),
+            (409, PutMode::Create, true),
+            (412, update, false),
+        ] {
+            server.push(
+                http::Response::builder()
+                    .status(status)
+                    .body(String::new())
+                    .unwrap(),
+            );
+            let err = client
+                .put_blob(&Path::from("file.txt"), "data".into(), mode.into())
+                .await
+                .unwrap_err();
+            match want_already_exists {
+                true => assert!(matches!(err, crate::Error::AlreadyExists { .. }), "{err}"),
+                false => assert!(matches!(err, crate::Error::Precondition { .. }), "{err}"),
+            }
+        }
     }
 
     #[tokio::test]

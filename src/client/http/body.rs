@@ -18,8 +18,8 @@
 use crate::client::{HttpError, HttpErrorKind};
 use crate::{PutPayload, collect_bytes};
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, SizeHint};
@@ -39,17 +39,17 @@ impl HttpRequestBody {
         Self(Inner::Bytes(Bytes::new()))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
     pub(crate) fn into_reqwest(self) -> reqwest::Body {
         match self.0 {
             Inner::Bytes(b) => b.into(),
-            Inner::PutPayload(_, payload) => reqwest::Body::wrap_stream(futures::stream::iter(
-                payload.into_iter().map(Ok::<_, HttpError>),
-            )),
+            Inner::PutPayload(_, payload) => reqwest::Body::wrap_stream(
+                futures_util::stream::iter(payload.into_iter().map(Ok::<_, HttpError>)),
+            ),
         }
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[cfg(all(feature = "reqwest", target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn into_reqwest(self) -> reqwest::Body {
         match self.0 {
             Inner::Bytes(b) => b.into(),
@@ -196,7 +196,7 @@ impl HttpResponseBody {
         String::from_utf8(b.into()).map_err(|e| HttpError::new(HttpErrorKind::Decode, e))
     }
 
-    #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+    #[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
     pub(crate) async fn json<B: serde::de::DeserializeOwned>(self) -> Result<B, HttpError> {
         let b = self.bytes().await?;
         serde_json::from_slice(&b).map_err(|e| HttpError::new(HttpErrorKind::Decode, e))

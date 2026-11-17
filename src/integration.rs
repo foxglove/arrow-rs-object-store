@@ -29,12 +29,13 @@ use crate::multipart::MultipartStore;
 use crate::path::Path;
 use crate::{
     Attribute, Attributes, DynObjectStore, Error, GetOptions, GetRange, MultipartUpload,
-    ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion, WriteMultipart,
+    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutPayload, UpdateVersion,
+    WriteMultipart,
 };
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
-use rand::{Rng, rng};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{StreamExt, TryStreamExt};
+use rand::{RngExt, rng};
 use std::collections::HashSet;
 use std::slice;
 
@@ -177,6 +178,7 @@ pub async fn put_get_delete_list(storage: &DynObjectStore) {
 
     let head = storage.head(&location).await.unwrap();
     assert_eq!(head.size, data.len() as u64);
+    assert_eq!(head.location, location);
 
     storage.delete(&location).await.unwrap();
 
@@ -283,7 +285,7 @@ pub async fn put_get_delete_list(storage: &DynObjectStore) {
 
     // "HELLO" percent encoded
     let hello_prefix = Path::parse("%48%45%4C%4C%4F").unwrap();
-    let path = hello_prefix.child("foo.parquet");
+    let path = hello_prefix.clone().join("foo.parquet");
 
     storage.put(&path, vec![0, 1].into()).await.unwrap();
     let files = flatten_list_stream(storage, Some(&hello_prefix))
@@ -411,7 +413,7 @@ pub async fn put_get_delete_list(storage: &DynObjectStore) {
     storage.put(&paths[4], "foo".into()).await.unwrap();
 
     let out_paths = storage
-        .delete_stream(futures::stream::iter(paths.clone()).map(Ok).boxed())
+        .delete_stream(futures_util::stream::iter(paths.clone()).map(Ok).boxed())
         .collect::<Vec<_>>()
         .await;
 
@@ -478,7 +480,7 @@ pub async fn put_get_attributes(integration: &dyn ObjectStore) {
             let r = integration.get(&path).await.unwrap();
             assert_eq!(r.attributes, attributes);
         }
-        Err(Error::NotImplemented) => {}
+        Err(Error::NotImplemented { .. }) => {}
         Err(e) => panic!("{e}"),
     }
 
@@ -491,7 +493,7 @@ pub async fn put_get_attributes(integration: &dyn ObjectStore) {
             let r = integration.get(&path).await.unwrap();
             assert_eq!(r.attributes, attributes);
         }
-        Err(Error::NotImplemented) => {}
+        Err(Error::NotImplemented { .. }) => {}
         Err(e) => panic!("{e}"),
     }
 }
@@ -606,7 +608,7 @@ pub async fn put_opts(storage: &dyn ObjectStore, supports_update: bool) {
             .put_opts(&path, "c".into(), PutMode::Update(v1.clone().into()).into())
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::NotImplemented), "{err}");
+        assert!(matches!(err, Error::NotImplemented { .. }), "{err}");
 
         return;
     }
@@ -713,7 +715,7 @@ pub async fn stream_get(storage: &DynObjectStore) {
     let bytes_expected = data.concat();
     let mut upload = storage.put_multipart(&location).await.unwrap();
     let uploads = data.into_iter().map(|x| upload.put_part(x.into()));
-    futures::future::try_join_all(uploads).await.unwrap();
+    futures_util::future::try_join_all(uploads).await.unwrap();
 
     // Object should not yet exist in store
     let meta_res = storage.head(&location).await;
@@ -1020,7 +1022,7 @@ pub async fn multipart(storage: &dyn ObjectStore, multipart: &dyn MultipartStore
 
     let id = multipart.create_multipart(&path).await.unwrap();
 
-    let parts: Vec<_> = futures::stream::iter(chunks)
+    let parts: Vec<_> = futures_util::stream::iter(chunks)
         .enumerate()
         .map(|(idx, b)| multipart.put_part(&path, &id, idx, b.into()))
         .buffered(2)
@@ -1050,6 +1052,91 @@ pub async fn multipart(storage: &dyn ObjectStore, multipart: &dyn MultipartStore
 
     let meta = storage.head(&path).await.unwrap();
     assert_eq!(meta.size, 0);
+}
+
+/// Tests [`MultipartStore::create_multipart_opts`]
+pub async fn multipart_with_opts(storage: &dyn ObjectStore, multipart: &dyn MultipartStore) {
+    let path = Path::from("test_multipart_with_opts");
+    let chunk_size = 5 * 1024 * 1024;
+    let chunks = get_chunks(chunk_size, 2);
+    let attributes =
+        Attributes::from_iter([(Attribute::Metadata("test_key".into()), "test_value")]);
+    let opts = PutMultipartOptions {
+        attributes: attributes.clone(),
+        ..Default::default()
+    };
+
+    let id = multipart.create_multipart_opts(&path, opts).await.unwrap();
+
+    let parts: Vec<_> = futures_util::stream::iter(chunks)
+        .enumerate()
+        .map(|(idx, b)| multipart.put_part(&path, &id, idx, b.into()))
+        .buffered(2)
+        .try_collect()
+        .await
+        .unwrap();
+
+    multipart
+        .complete_multipart(&path, &id, parts)
+        .await
+        .unwrap();
+
+    let result = storage.get(&path).await.unwrap();
+    assert_eq!(result.meta.size, chunk_size as u64 * 2);
+    // Some providers add default attributes, e.g. S3 may report a default Content-Type.
+    for (attribute, value) in &attributes {
+        assert_eq!(result.attributes.get(attribute), Some(value));
+    }
+}
+
+/// Tests that [`MultipartStore::put_part`] may be invoked with non-sequential part indices.
+pub async fn multipart_put_part_out_of_order(
+    storage: &dyn ObjectStore,
+    multipart: &dyn MultipartStore,
+) {
+    let path = Path::from("test_multipart_put_part_out_of_order");
+
+    // S3: each part except the last must be ≥ 5 MiB.
+    const MIN_MULTIPART_PART: usize = 5 * 1024 * 1024;
+    let part0_data = Bytes::from(vec![0xAA_u8; MIN_MULTIPART_PART]);
+    let part1_data = Bytes::from(vec![0xBB_u8; MIN_MULTIPART_PART]);
+    let part2_data = Bytes::from_static(b"tail");
+
+    let upload_id = multipart.create_multipart(&path).await.unwrap();
+
+    let part2 = multipart
+        .put_part(&path, &upload_id, 2, PutPayload::from(part2_data.clone()))
+        .await
+        .unwrap();
+
+    let part0 = multipart
+        .put_part(&path, &upload_id, 0, PutPayload::from(part0_data.clone()))
+        .await
+        .unwrap();
+
+    let part1 = multipart
+        .put_part(&path, &upload_id, 1, PutPayload::from(part1_data.clone()))
+        .await
+        .unwrap();
+
+    let result = multipart
+        .complete_multipart(&path, &upload_id, vec![part0, part1, part2])
+        .await
+        .unwrap();
+    assert!(result.e_tag.is_some(), "Expected e_tag in PutResult");
+
+    let data = storage.get(&path).await.unwrap().bytes().await.unwrap();
+    assert_eq!(
+        data.len(),
+        part0_data.len() + part1_data.len() + part2_data.len()
+    );
+    assert!(data[..MIN_MULTIPART_PART].iter().all(|&b| b == 0xAA));
+    assert!(
+        data[MIN_MULTIPART_PART..2 * MIN_MULTIPART_PART]
+            .iter()
+            .all(|&b| b == 0xBB)
+    );
+    assert_eq!(&data[2 * MIN_MULTIPART_PART..], part2_data.as_ref());
 }
 
 async fn delete_fixtures(storage: &DynObjectStore) {
@@ -1264,3 +1351,213 @@ pub async fn list_paginated(storage: &dyn ObjectStore, list: &dyn PaginatedListS
     );
     assert!(ret.page_token.is_none());
 }
+
+/// Tests that [`ObjectStore::list_with_offset`] returns an exclusive list
+/// that does not include the offset value itself.
+/// This is needed because some object stores (i.e. Azure) return inclusive results,
+/// while AWS S3 and GCP return exclusive results.
+pub async fn list_with_offset_exclusivity(storage: &DynObjectStore) {
+    delete_fixtures(storage).await;
+
+    // Create a set of test files with predictable ordering
+    let files = vec![
+        Path::from("test_offset/file_a.txt"),
+        Path::from("test_offset/file_b.txt"),
+        Path::from("test_offset/file_c.txt"),
+        Path::from("test_offset/file_d.txt"),
+        Path::from("test_offset/file_e.txt"),
+    ];
+
+    let data = Bytes::from("test data");
+    for file in &files {
+        storage.put(file, data.clone().into()).await.unwrap();
+    }
+
+    // Test 1: Offset at file_b, should return c, d, e but NOT b
+    let offset = Path::from("test_offset/file_b.txt");
+    let result: Vec<Path> = storage
+        .list_with_offset(Some(&Path::from("test_offset")), &offset)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await
+        .unwrap();
+
+    // Verify that the offset file (file_b) is NOT in the results
+    assert!(
+        !result.contains(&offset),
+        "list_with_offset should not include the offset value itself. Found {:?} in results: {:?}",
+        offset,
+        result
+    );
+
+    // Verify that only files after the offset are returned
+    let expected = vec![
+        Path::from("test_offset/file_c.txt"),
+        Path::from("test_offset/file_d.txt"),
+        Path::from("test_offset/file_e.txt"),
+    ];
+    assert_eq!(
+        result.len(),
+        expected.len(),
+        "Expected {} files after offset, got {}",
+        expected.len(),
+        result.len()
+    );
+    for file in &expected {
+        assert!(
+            result.contains(file),
+            "Expected file {:?} to be in results",
+            file
+        );
+    }
+
+    // Test 2: Offset at file_a, should return b, c, d, e but NOT a
+    let offset = Path::from("test_offset/file_a.txt");
+    let result: Vec<Path> = storage
+        .list_with_offset(Some(&Path::from("test_offset")), &offset)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert!(
+        !result.contains(&offset),
+        "list_with_offset should not include the offset value itself. Found {:?} in results: {:?}",
+        offset,
+        result
+    );
+    assert_eq!(result.len(), 4, "Expected 4 files after first file");
+
+    // Test 3: Offset at file_e (last file), should return empty list
+    let offset = Path::from("test_offset/file_e.txt");
+    let result: Vec<Path> = storage
+        .list_with_offset(Some(&Path::from("test_offset")), &offset)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_empty(),
+        "list_with_offset with offset at last file should return empty list, got: {:?}",
+        result
+    );
+
+    // Test 4: Test without prefix - offset should still be exclusive
+    let offset = Path::from("test_offset/file_c.txt");
+    let result: Vec<Path> = storage
+        .list_with_offset(None, &offset)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert!(
+        !result.contains(&offset),
+        "list_with_offset without prefix should not include the offset value itself. Found {:?} in results: {:?}",
+        offset,
+        result
+    );
+
+    // Verify only files after file_c are included
+    let expected = vec![
+        Path::from("test_offset/file_d.txt"),
+        Path::from("test_offset/file_e.txt"),
+    ];
+    assert_eq!(result.len(), expected.len());
+    for file in &expected {
+        assert!(result.contains(file), "Expected file {:?} in results", file);
+    }
+
+    // Clean up
+    delete_fixtures(storage).await;
+}
+
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi"))
+))]
+mod marker {
+    use super::*;
+    use crate::ClientOptions;
+    use crate::client::{
+        HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
+        ReqwestConnector,
+    };
+    use async_trait::async_trait;
+
+    /// A marker inserted into response extensions by [`MarkerHttpConnector`]
+    #[derive(Clone, Debug, PartialEq)]
+    struct Marker;
+
+    /// [`HttpService`] middleware that tags every response with a [`Marker`]
+    #[derive(Debug)]
+    struct MarkerService(HttpClient);
+
+    #[async_trait]
+    impl HttpService for MarkerService {
+        async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let mut response = self.0.execute(req).await?;
+            response.extensions_mut().insert(Marker);
+            Ok(response)
+        }
+    }
+
+    /// An [`HttpConnector`] that tags the extensions of every HTTP response with a
+    /// marker, allowing [`response_extensions`] to verify their propagation
+    #[derive(Debug, Default)]
+    pub struct MarkerHttpConnector(ReqwestConnector);
+
+    impl HttpConnector for MarkerHttpConnector {
+        fn connect(&self, options: &ClientOptions) -> crate::Result<HttpClient> {
+            let client = self.0.connect(options)?;
+            Ok(HttpClient::new(MarkerService(client)))
+        }
+    }
+
+    /// Tests that the extensions of HTTP responses are propagated to returned results
+    ///
+    /// The provided store must have been built with [`MarkerHttpConnector`]
+    pub async fn response_extensions(storage: &DynObjectStore, test_multipart: bool) {
+        delete_fixtures(storage).await;
+
+        let location = Path::from("test_response_extensions/file.txt");
+        let data = Bytes::from("arbitrary data");
+
+        let put = storage.put(&location, data.clone().into()).await.unwrap();
+        assert!(
+            put.extensions.get::<Marker>().is_some(),
+            "PutResult should contain the response extensions"
+        );
+
+        let get = storage.get(&location).await.unwrap();
+        assert!(
+            get.extensions.get::<Marker>().is_some(),
+            "GetResult should contain the response extensions"
+        );
+
+        let list = storage.list_with_delimiter(None).await.unwrap();
+        assert!(
+            list.extensions.get::<Marker>().is_some(),
+            "ListResult should contain the response extensions"
+        );
+
+        if test_multipart {
+            let mut upload = storage.put_multipart(&location).await.unwrap();
+            upload.put_part(data.into()).await.unwrap();
+            let complete = upload.complete().await.unwrap();
+            assert!(
+                complete.extensions.get::<Marker>().is_some(),
+                "PutResult of a completed multipart upload should contain the response extensions"
+            );
+        }
+
+        delete_fixtures(storage).await;
+    }
+}
+
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi"))
+))]
+pub use marker::{MarkerHttpConnector, response_extensions};

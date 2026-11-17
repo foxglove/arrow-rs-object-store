@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::{HttpConnector, TokenCredentialProvider, http_connector};
+use crate::client::{
+    CryptoProvider, HttpConnector, TokenCredentialProvider, crypto_provider, http_connector,
+};
 use crate::config::ConfigValue;
 use crate::gcp::client::{GoogleCloudStorageClient, GoogleCloudStorageConfig};
 use crate::gcp::credential::{
@@ -98,6 +100,8 @@ pub struct GoogleCloudStorageBuilder {
     bucket_name: Option<String>,
     /// Url
     url: Option<String>,
+    /// Base URL
+    base_url: Option<String>,
     /// Path to the service account file
     service_account_path: Option<String>,
     /// The serialized service account key
@@ -110,6 +114,10 @@ pub struct GoogleCloudStorageBuilder {
     client_options: ClientOptions,
     /// Credentials
     credentials: Option<GcpCredentialProvider>,
+    /// Explicit bearer token, if configured
+    bearer_token: Option<String>,
+    /// The [`CryptoProvider`] to use
+    crypto: Option<Arc<dyn CryptoProvider>>,
     /// Skip signing requests
     skip_signature: ConfigValue<bool>,
     /// Credentials for sign url
@@ -159,6 +167,15 @@ pub enum GoogleConfigKey {
     /// - `bucket_name`
     Bucket,
 
+    /// Base URL
+    ///
+    /// See [`GoogleCloudStorageBuilder::with_base_url`] for details.
+    ///
+    /// Supported keys:
+    /// - `google_base_url`
+    /// - `base_url`
+    BaseUrl,
+
     /// Application credentials path
     ///
     /// See [`GoogleCloudStorageBuilder::with_application_credentials`].
@@ -167,6 +184,15 @@ pub enum GoogleConfigKey {
     /// - `google_application_credentials`
     /// - `application_credentials`
     ApplicationCredentials,
+
+    /// Explicit OAuth bearer token
+    ///
+    /// This is treated as a static token and will not be refreshed automatically.
+    ///
+    /// Supported keys:
+    /// - `google_bearer_token`
+    /// - `bearer_token`
+    BearerToken,
 
     /// Skip signing request
     ///
@@ -185,7 +211,9 @@ impl AsRef<str> for GoogleConfigKey {
             Self::ServiceAccount => "google_service_account",
             Self::ServiceAccountKey => "google_service_account_key",
             Self::Bucket => "google_bucket",
+            Self::BaseUrl => "google_base_url",
             Self::ApplicationCredentials => "google_application_credentials",
+            Self::BearerToken => "google_bearer_token",
             Self::SkipSignature => "google_skip_signature",
             Self::Client(key) => key.as_ref(),
         }
@@ -203,9 +231,11 @@ impl FromStr for GoogleConfigKey {
             | "service_account_path" => Ok(Self::ServiceAccount),
             "google_service_account_key" | "service_account_key" => Ok(Self::ServiceAccountKey),
             "google_bucket" | "google_bucket_name" | "bucket" | "bucket_name" => Ok(Self::Bucket),
+            "google_base_url" | "base_url" => Ok(Self::BaseUrl),
             "google_application_credentials" | "application_credentials" => {
                 Ok(Self::ApplicationCredentials)
             }
+            "google_bearer_token" | "bearer_token" => Ok(Self::BearerToken),
             "google_skip_signature" | "skip_signature" => Ok(Self::SkipSignature),
             _ => match s.strip_prefix("google_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
@@ -225,7 +255,10 @@ impl Default for GoogleCloudStorageBuilder {
             retry_config: Default::default(),
             client_options: ClientOptions::new().with_allow_http(true),
             url: None,
+            base_url: None,
             credentials: None,
+            bearer_token: None,
+            crypto: None,
             skip_signature: Default::default(),
             signing_credentials: None,
             http_connector: None,
@@ -304,9 +337,11 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ServiceAccount => self.service_account_path = Some(value.into()),
             GoogleConfigKey::ServiceAccountKey => self.service_account_key = Some(value.into()),
             GoogleConfigKey::Bucket => self.bucket_name = Some(value.into()),
+            GoogleConfigKey::BaseUrl => self.base_url = Some(value.into()),
             GoogleConfigKey::ApplicationCredentials => {
                 self.application_credentials_path = Some(value.into())
             }
+            GoogleConfigKey::BearerToken => self = self.with_bearer_token(value),
             GoogleConfigKey::SkipSignature => self.skip_signature.parse(value),
             GoogleConfigKey::Client(key) => {
                 self.client_options = self.client_options.with_config(key, value)
@@ -331,7 +366,9 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ServiceAccount => self.service_account_path.clone(),
             GoogleConfigKey::ServiceAccountKey => self.service_account_key.clone(),
             GoogleConfigKey::Bucket => self.bucket_name.clone(),
+            GoogleConfigKey::BaseUrl => self.base_url.clone(),
             GoogleConfigKey::ApplicationCredentials => self.application_credentials_path.clone(),
+            GoogleConfigKey::BearerToken => self.bearer_token.clone(),
             GoogleConfigKey::SkipSignature => Some(self.skip_signature.to_string()),
             GoogleConfigKey::Client(key) => self.client_options.get_config_value(key),
         }
@@ -364,6 +401,25 @@ impl GoogleCloudStorageBuilder {
     /// Set the bucket name (required)
     pub fn with_bucket_name(mut self, bucket_name: impl Into<String>) -> Self {
         self.bucket_name = Some(bucket_name.into());
+        self
+    }
+
+    /// Sets the base URL for communicating with GCS.
+    ///
+    /// If not explicitly set, it will be:
+    /// 1. Derived from the service account credentials, if provided
+    /// 2. Otherwise, uses the default GCS endpoint
+    ///
+    /// # Example
+    /// ```
+    /// use object_store::gcp::GoogleCloudStorageBuilder;
+    ///
+    /// let gcs = GoogleCloudStorageBuilder::from_env()
+    ///     .with_base_url("https://localhost:4443")
+    ///     .build();
+    /// ```
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.into());
         self
     }
 
@@ -410,6 +466,18 @@ impl GoogleCloudStorageBuilder {
         self
     }
 
+    /// Set an explicit OAuth bearer token.
+    ///
+    /// This is treated as a static token and will not be refreshed automatically.
+    pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
+        let bearer_token = bearer_token.into();
+        self.credentials = Some(Arc::new(StaticCredentialProvider::new(GcpCredential {
+            bearer: bearer_token.clone(),
+        })));
+        self.bearer_token = Some(bearer_token);
+        self
+    }
+
     /// If enabled, [`GoogleCloudStorage`] will not fetch credentials and will not sign requests.
     ///
     /// This can be useful when interacting with public GCS buckets that deny authorized requests.
@@ -421,6 +489,19 @@ impl GoogleCloudStorageBuilder {
     /// Set the credential provider overriding any other options
     pub fn with_credentials(mut self, credentials: GcpCredentialProvider) -> Self {
         self.credentials = Some(credentials);
+        self.bearer_token = None;
+        self
+    }
+
+    /// Set the signing credential provider overriding any other options
+    pub fn with_signing_credentials(mut self, credentials: GcpSigningCredentialProvider) -> Self {
+        self.signing_credentials = Some(credentials);
+        self
+    }
+
+    /// The [`CryptoProvider`] to use
+    pub fn with_crypto_provider(mut self, provider: Arc<dyn CryptoProvider>) -> Self {
+        self.crypto = Some(provider);
         self
     }
 
@@ -472,7 +553,6 @@ impl GoogleCloudStorageBuilder {
         }
 
         let bucket_name = self.bucket_name.ok_or(Error::MissingBucketName {})?;
-
         let http = http_connector(self.http_connector)?;
 
         // First try to initialize from the service account information.
@@ -506,9 +586,13 @@ impl GoogleCloudStorageBuilder {
             .map(|c| c.disable_oauth)
             .unwrap_or(false);
 
-        let gcs_base_url: String = service_account_credentials
-            .as_ref()
-            .and_then(|c| c.gcs_base_url.clone())
+        let gcs_base_url: String = self
+            .base_url
+            .or_else(|| {
+                service_account_credentials
+                    .as_ref()
+                    .and_then(|c| c.gcs_base_url.clone())
+            })
             .unwrap_or_else(|| DEFAULT_GCS_BASE_URL.to_string());
 
         let credentials = if let Some(credentials) = self.credentials {
@@ -518,8 +602,9 @@ impl GoogleCloudStorageBuilder {
                 bearer: "".to_string(),
             })) as _
         } else if let Some(credentials) = service_account_credentials.clone() {
+            let crypto = crypto_provider(self.crypto.as_deref())?;
             Arc::new(TokenCredentialProvider::new(
-                credentials.token_provider()?,
+                credentials.token_provider(crypto)?,
                 http.connect(&self.client_options)?,
                 self.retry_config.clone(),
             )) as _
@@ -534,8 +619,9 @@ impl GoogleCloudStorageBuilder {
                     .with_min_ttl(TOKEN_MIN_TTL),
                 ) as _,
                 ApplicationDefaultCredentials::ServiceAccount(token) => {
+                    let crypto = crypto_provider(self.crypto.as_deref())?;
                     Arc::new(TokenCredentialProvider::new(
-                        token.token_provider()?,
+                        token.token_provider(crypto)?,
                         http.connect(&self.client_options)?,
                         self.retry_config.clone(),
                     )) as _
@@ -560,7 +646,8 @@ impl GoogleCloudStorageBuilder {
                 private_key: None,
             })) as _
         } else if let Some(credentials) = service_account_credentials.clone() {
-            credentials.signing_credentials()?
+            let crypto = crypto_provider(self.crypto.as_deref())?;
+            credentials.signing_credentials(crypto)?
         } else if let Some(credentials) = application_default_credentials.clone() {
             match credentials {
                 ApplicationDefaultCredentials::AuthorizedUser(token) => {
@@ -571,7 +658,8 @@ impl GoogleCloudStorageBuilder {
                     )) as _
                 }
                 ApplicationDefaultCredentials::ServiceAccount(token) => {
-                    token.signing_credentials()?
+                    let crypto = crypto_provider(self.crypto.as_deref())?;
+                    token.signing_credentials(crypto)?
                 }
             }
         } else {
@@ -587,6 +675,7 @@ impl GoogleCloudStorageBuilder {
             credentials,
             signing_credentials,
             bucket_name,
+            crypto: self.crypto,
             retry_config: self.retry_config,
             client_options: self.client_options,
             skip_signature: self.skip_signature.get()?,
@@ -607,6 +696,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     const FAKE_KEY: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true}"#;
+    const FAKE_KEY_WITH_BASE_URL: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true, "gcs_base_url": "https://base-url-from-credentials:4443"}"#;
 
     #[test]
     fn gcs_test_service_account_key_and_path() {
@@ -642,8 +732,8 @@ mod tests {
         assert_eq!(builder.bucket_name.unwrap(), google_bucket_name.as_str());
     }
 
-    #[test]
-    fn gcs_test_config_aliases() {
+    #[tokio::test]
+    async fn gcs_test_config_aliases() {
         // Service account path
         for alias in [
             "google_service_account",
@@ -674,8 +764,20 @@ mod tests {
                 GoogleCloudStorageBuilder::new().with_config(alias.parse().unwrap(), "fake_bucket");
             assert_eq!("fake_bucket", builder.bucket_name.unwrap());
         }
+
+        for alias in ["google_bearer_token", "bearer_token"] {
+            let gcs = GoogleCloudStorageBuilder::new()
+                .with_config(alias.parse().unwrap(), "test-token")
+                .with_bucket_name("fake_bucket")
+                .build()
+                .unwrap();
+
+            let credential = gcs.credentials().get_credential().await.unwrap();
+            assert_eq!(credential.bearer, "test-token");
+        }
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn gcs_test_proxy_url() {
         let mut tfile = NamedTempFile::new().unwrap();
@@ -712,6 +814,7 @@ mod tests {
         builder.parse_url("mailto://bucket/path").unwrap_err();
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn gcs_test_service_account_key_only() {
         let _ = GoogleCloudStorageBuilder::new()
@@ -721,13 +824,56 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn gcs_test_with_base_url() {
+        let no_base_url = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .build()
+            .unwrap();
+        assert_eq!(no_base_url.client.config().base_url, DEFAULT_GCS_BASE_URL);
+
+        let explicit_override = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_base_url("https://explicitly-overridden:4443")
+            .build()
+            .unwrap();
+        assert_eq!(
+            explicit_override.client.config().base_url,
+            "https://explicitly-overridden:4443"
+        );
+
+        let url_in_credentials = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_service_account_key(FAKE_KEY_WITH_BASE_URL)
+            .build()
+            .unwrap();
+        assert_eq!(
+            url_in_credentials.client.config().base_url,
+            "https://base-url-from-credentials:4443"
+        );
+
+        let explicit_override_and_credentials = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_base_url("https://explicitly-overridden:4443") // this should take precedence
+            .with_service_account_key(FAKE_KEY_WITH_BASE_URL)
+            .build()
+            .unwrap();
+        assert_eq!(
+            explicit_override_and_credentials.client.config().base_url,
+            "https://explicitly-overridden:4443"
+        );
+    }
+
     #[test]
     fn gcs_test_config_get_value() {
         let google_service_account = "object_store:fake_service_account".to_string();
         let google_bucket_name = "object_store:fake_bucket".to_string();
+        let google_bearer_token = "test-token".to_string();
         let builder = GoogleCloudStorageBuilder::new()
             .with_config(GoogleConfigKey::ServiceAccount, &google_service_account)
-            .with_config(GoogleConfigKey::Bucket, &google_bucket_name);
+            .with_config(GoogleConfigKey::Bucket, &google_bucket_name)
+            .with_config(GoogleConfigKey::BearerToken, &google_bearer_token);
 
         assert_eq!(
             builder
@@ -738,6 +884,28 @@ mod tests {
         assert_eq!(
             builder.get_config_value(&GoogleConfigKey::Bucket).unwrap(),
             google_bucket_name
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&GoogleConfigKey::BearerToken)
+                .unwrap(),
+            google_bearer_token
+        );
+    }
+
+    #[test]
+    fn gcs_test_with_credentials_clears_bearer_config_value() {
+        let custom_creds = Arc::new(StaticCredentialProvider::new(GcpCredential {
+            bearer: "custom-token".to_string(),
+        }));
+
+        let builder = GoogleCloudStorageBuilder::new()
+            .with_bearer_token("test-token")
+            .with_credentials(custom_creds);
+
+        assert_eq!(
+            builder.get_config_value(&GoogleConfigKey::BearerToken),
+            None
         );
     }
 
@@ -754,6 +922,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn gcs_test_explicit_creds_skip_invalid_adc() {
         // Create a valid service account key file
@@ -782,6 +951,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn gcs_test_explicit_creds_with_service_account_key_skip_invalid_adc() {
         // Create invalid ADC file with unsupported credential type
@@ -805,6 +975,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn gcs_test_adc_error_propagated_without_explicit_creds() {
         // Create invalid ADC file with unsupported credential type
@@ -832,6 +1003,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn gcs_test_with_credentials_skip_invalid_adc() {
         use crate::StaticCredentialProvider;

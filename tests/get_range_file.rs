@@ -19,7 +19,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures_util::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::*;
@@ -56,10 +56,6 @@ impl ObjectStore for MyStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.0.get_opts(location, options).await
-    }
-
-    async fn delete(&self, _: &Path) -> Result<()> {
-        todo!()
     }
 
     fn delete_stream(

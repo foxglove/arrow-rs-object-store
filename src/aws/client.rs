@@ -30,9 +30,12 @@ use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::s3::{
     CompleteMultipartUpload, CompleteMultipartUploadResult, CopyPartResult,
-    InitiateMultipartUploadResult, ListResponse, PartMetadata,
+    InitiateMultipartUploadResult, ListResponse, PartMetadata, to_list_result,
 };
-use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
+use crate::client::{
+    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpResponse,
+    crypto_provider,
+};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::{
@@ -52,13 +55,12 @@ use itertools::Itertools;
 use md5::{Digest, Md5};
 use percent_encoding::{PercentEncode, utf8_percent_encode};
 use quick_xml::events::{self as xml_events};
-use ring::digest;
-use ring::digest::Context;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 const VERSION_HEADER: &str = "x-amz-version-id";
 const SHA256_CHECKSUM: &str = "x-amz-checksum-sha256";
+const CRC64NVME_CHECKSUM: &str = "x-amz-checksum-crc64nvme";
 const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const ALGORITHM: &str = "x-amz-checksum-algorithm";
 const STORAGE_CLASS: &str = "x-amz-storage-class";
@@ -69,6 +71,7 @@ pub(crate) enum Error {
     #[error("Error performing DeleteObjects request: {}", source)]
     DeleteObjectsRequest {
         source: crate::client::retry::RetryError,
+        paths: Vec<String>,
     },
 
     #[error(
@@ -94,6 +97,8 @@ pub(crate) enum Error {
     #[error("Error performing list request: {}", source)]
     ListRequest {
         source: crate::client::retry::RetryError,
+        /// The prefix that was being listed, used only for error classification
+        path: String,
     },
 
     #[error("Error getting list response body: {}", source)]
@@ -127,6 +132,8 @@ impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
+            Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
+            Error::ListRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -138,6 +145,7 @@ impl From<Error> for crate::Error {
 pub(crate) enum PutPartPayload<'a> {
     Part(PutPayload),
     Copy(&'a Path),
+    CopyRange(&'a Path, std::ops::Range<u64>),
 }
 
 impl Default for PutPartPayload<'_> {
@@ -196,17 +204,23 @@ pub(crate) struct S3Config {
     pub bucket: String,
     pub bucket_endpoint: String,
     pub credentials: AwsCredentialProvider,
+    pub crypto: Option<Arc<dyn CryptoProvider>>,
     pub session_provider: Option<AwsCredentialProvider>,
     pub retry_config: RetryConfig,
     pub client_options: ClientOptions,
     pub sign_payload: bool,
     pub skip_signature: bool,
     pub disable_tagging: bool,
+    pub disable_bulk_delete: bool,
     pub checksum: Option<Checksum>,
     pub copy_if_not_exists: Option<S3CopyIfNotExists>,
     pub conditional_put: S3ConditionalPut,
     pub request_payer: bool,
     pub(super) encryption_headers: S3EncryptionHeaders,
+    /// Threshold in bytes above which copy will use multipart copy
+    pub multipart_copy_threshold: u64,
+    /// Preferred multipart copy part size in bytes (None => auto)
+    pub multipart_copy_part_size: u64,
 }
 
 impl S3Config {
@@ -214,19 +228,18 @@ impl S3Config {
         format!("{}/{}", self.bucket_endpoint, encode_path(path))
     }
 
-    async fn get_session_credential(&self) -> Result<SessionCredential<'_>> {
-        let credential = match self.skip_signature {
+    async fn get_session_credential(&self) -> Result<Option<SessionCredential<'_>>> {
+        Ok(match self.skip_signature {
             false => {
                 let provider = self.session_provider.as_ref().unwrap_or(&self.credentials);
-                Some(provider.get_credential().await?)
+                let credential = provider.get_credential().await?;
+                Some(SessionCredential {
+                    credential,
+                    session_token: self.session_provider.is_some(),
+                    config: self,
+                })
             }
             true => None,
-        };
-
-        Ok(SessionCredential {
-            credential,
-            session_token: self.session_provider.is_some(),
-            config: self,
         })
     }
 
@@ -241,27 +254,32 @@ impl S3Config {
     pub(crate) fn is_s3_express(&self) -> bool {
         self.session_provider.is_some()
     }
+
+    pub(crate) fn crypto(&self) -> Result<&dyn CryptoProvider> {
+        crypto_provider(self.crypto.as_deref())
+    }
 }
 
 struct SessionCredential<'a> {
-    credential: Option<Arc<AwsCredential>>,
+    credential: Arc<AwsCredential>,
     session_token: bool,
     config: &'a S3Config,
 }
 
 impl SessionCredential<'_> {
-    fn authorizer(&self) -> Option<AwsAuthorizer<'_>> {
+    fn authorizer(&self) -> Result<AwsAuthorizer<'_>> {
         let mut authorizer =
-            AwsAuthorizer::new(self.credential.as_deref()?, "s3", &self.config.region)
+            AwsAuthorizer::new(self.credential.as_ref(), "s3", &self.config.region)
                 .with_sign_payload(self.config.sign_payload)
-                .with_request_payer(self.config.request_payer);
+                .with_request_payer(self.config.request_payer)
+                .with_crypto(self.config.crypto()?);
 
         if self.session_token {
             let token = HeaderName::from_static("x-amz-s3session-token");
             authorizer = authorizer.with_token_header(token)
         }
 
-        Some(authorizer)
+        Ok(authorizer)
     }
 }
 
@@ -289,12 +307,12 @@ impl From<RequestError> for crate::Error {
     }
 }
 
-/// A builder for a request allowing customisation of the headers and query string
+/// A builder for a request allowing customization of the headers and query string
 pub(crate) struct Request<'a> {
     path: &'a Path,
     config: &'a S3Config,
     builder: HttpRequestBuilder,
-    payload_sha256: Option<digest::Digest>,
+    payload_sha256: Option<[u8; 32]>,
     payload: Option<PutPayload>,
     use_session_creds: bool,
     idempotent: bool,
@@ -395,43 +413,70 @@ impl Request<'_> {
         Self { builder, ..self }
     }
 
-    pub(crate) fn with_payload(mut self, payload: PutPayload) -> Self {
-        if (!self.config.skip_signature && self.config.sign_payload)
-            || self.config.checksum.is_some()
-        {
-            let mut sha256 = Context::new(&digest::SHA256);
-            payload.iter().for_each(|x| sha256.update(x));
-            let payload_sha256 = sha256.finish();
+    pub(crate) fn with_payload(mut self, payload: PutPayload) -> Result<Self> {
+        let mut cached_digest: Option<[u8; 32]> = None;
+        let mut sha256_digest = || -> Result<[u8; 32]> {
+            if let Some(digest) = cached_digest {
+                return Ok(digest);
+            }
+            let mut ctx = self.config.crypto()?.digest(DigestAlgorithm::Sha256)?;
+            for part in &payload {
+                ctx.update(part);
+            }
+            let digest = ctx.finish()?.try_into().unwrap();
+            cached_digest = Some(digest);
+            Ok(digest)
+        };
 
-            if let Some(Checksum::SHA256) = self.config.checksum {
+        if !self.config.skip_signature && self.config.sign_payload {
+            self.payload_sha256 = Some(sha256_digest()?);
+        }
+
+        match self.config.checksum {
+            Some(Checksum::SHA256) => {
                 self.builder = self
                     .builder
-                    .header(SHA256_CHECKSUM, BASE64_STANDARD.encode(payload_sha256));
+                    .header(SHA256_CHECKSUM, BASE64_STANDARD.encode(sha256_digest()?));
             }
-            self.payload_sha256 = Some(payload_sha256);
+            Some(Checksum::CRC64NVME) => {
+                let crc_algo = crc_fast::CrcAlgorithm::Crc64Nvme;
+                let mut digest = crc_fast::Digest::new(crc_algo);
+                payload.iter().for_each(|x| digest.update(x));
+                let checksum = digest.finalize();
+
+                self.builder = self.builder.header(
+                    CRC64NVME_CHECKSUM,
+                    BASE64_STANDARD.encode(checksum.to_be_bytes()),
+                )
+            }
+            None => {}
         }
 
         let content_length = payload.content_length();
         self.builder = self.builder.header(CONTENT_LENGTH, content_length);
         self.payload = Some(payload);
-        self
+        Ok(self)
     }
 
     pub(crate) async fn send(self) -> Result<HttpResponse, RequestError> {
         let credential = match self.use_session_creds {
             true => self.config.get_session_credential().await?,
-            false => SessionCredential {
-                credential: self.config.get_credential().await?,
-                session_token: false,
-                config: self.config,
-            },
+            false => {
+                let credential = self.config.get_credential().await?;
+                credential.map(|credential| SessionCredential {
+                    credential,
+                    session_token: false,
+                    config: self.config,
+                })
+            }
         };
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
 
         let sha = self.payload_sha256.as_ref().map(|x| x.as_ref());
 
         let path = self.path.as_ref();
         self.builder
-            .with_aws_sigv4(credential.authorizer(), sha)
+            .with_aws_sigv4(authorizer, sha)?
             .retryable(&self.config.retry_config)
             .retry_on_conflict(self.retry_on_conflict)
             .idempotent(self.idempotent)
@@ -447,8 +492,10 @@ impl Request<'_> {
 
     pub(crate) async fn do_put(self) -> Result<PutResult> {
         let response = self.send().await?;
-        Ok(get_put_result(response.headers(), VERSION_HEADER)
-            .map_err(|source| Error::Metadata { source })?)
+        Ok(
+            get_put_result(response, VERSION_HEADER)
+                .map_err(|source| Error::Metadata { source })?,
+        )
     }
 }
 
@@ -465,9 +512,13 @@ impl S3Client {
 
     pub(crate) fn request<'a>(&'a self, method: Method, path: &'a Path) -> Request<'a> {
         let url = self.config.path_url(path);
+        let mut builder = self.client.request(method, url);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
         Request {
             path,
-            builder: self.client.request(method, url),
+            builder,
             payload: None,
             payload_sha256: None,
             config: &self.config,
@@ -491,6 +542,7 @@ impl S3Client {
         }
 
         let credential = self.config.get_session_credential().await?;
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = format!("{}?delete", self.config.bucket_endpoint);
 
         let mut buffer = Vec::new();
@@ -533,8 +585,15 @@ impl S3Client {
         let body = Bytes::from(buffer);
 
         let mut builder = self.client.request(Method::POST, url);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
 
-        let digest = digest::digest(&digest::SHA256, &body);
+        let crypto = self.config.crypto()?;
+        let mut ctx = crypto.digest(DigestAlgorithm::Sha256)?;
+        ctx.update(body.as_ref());
+        let digest = ctx.finish()?;
+
         builder = builder.header(SHA256_CHECKSUM, BASE64_STANDARD.encode(digest));
 
         // S3 *requires* DeleteObjects to include a Content-MD5 header:
@@ -548,10 +607,15 @@ impl S3Client {
         let response = builder
             .header(CONTENT_TYPE, "application/xml")
             .body(body)
-            .with_aws_sigv4(credential.authorizer(), Some(digest.as_ref()))
-            .send_retry(&self.config.retry_config)
+            .with_aws_sigv4(authorizer, Some(digest))?
+            .retryable(&self.config.retry_config)
+            .retry_error_body(true)
+            .send()
             .await
-            .map_err(|source| Error::DeleteObjectsRequest { source })?
+            .map_err(|source| Error::DeleteObjectsRequest {
+                source,
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            })?
             .into_body()
             .bytes()
             .await
@@ -579,6 +643,16 @@ impl S3Client {
         }
 
         Ok(results)
+    }
+
+    /// Make a single-object S3 Delete request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html>
+    ///
+    /// Unlike [`bulk_delete_request`](Self::bulk_delete_request), this issues a
+    /// plain `DELETE /key` request, which is part of the core S3 API and is
+    /// supported by every S3-compatible provider.
+    pub(crate) async fn delete_request(&self, path: &Path) -> Result<()> {
+        self.request(Method::DELETE, path).send().await?;
+        Ok(())
     }
 
     /// Make an S3 Copy request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html>
@@ -646,6 +720,9 @@ impl S3Client {
                 Checksum::SHA256 => {
                     request = request.header(ALGORITHM, "SHA256");
                 }
+                Checksum::CRC64NVME => {
+                    request = request.header(ALGORITHM, "CRC64NVME");
+                }
             }
         }
         let response = request
@@ -676,7 +753,10 @@ impl S3Client {
         part_idx: usize,
         data: PutPartPayload<'_>,
     ) -> Result<PartId> {
-        let is_copy = matches!(data, PutPartPayload::Copy(_));
+        let is_copy = matches!(
+            data,
+            PutPartPayload::Copy(_) | PutPartPayload::CopyRange(_, _)
+        );
         let part = (part_idx + 1).to_string();
 
         let mut request = self
@@ -685,11 +765,23 @@ impl S3Client {
             .idempotent(true);
 
         request = match data {
-            PutPartPayload::Part(payload) => request.with_payload(payload),
+            PutPartPayload::Part(payload) => request.with_payload(payload)?,
             PutPartPayload::Copy(path) => request.header(
                 "x-amz-copy-source",
                 &format!("{}/{}", self.config.bucket, encode_path(path)),
             ),
+            PutPartPayload::CopyRange(path, range) => {
+                // AWS expects inclusive end for copy range header
+                let start = range.start;
+                let end_inclusive = range.end.saturating_sub(1);
+                let range_value = format!("bytes={}-{}", start, end_inclusive);
+                request
+                    .header(
+                        "x-amz-copy-source",
+                        &format!("{}/{}", self.config.bucket, encode_path(path)),
+                    )
+                    .header("x-amz-copy-source-range", &range_value)
+            }
         };
 
         if self
@@ -701,34 +793,45 @@ impl S3Client {
             // If SSE-C is used, we must include the encryption headers in every upload request.
             request = request.with_encryption_headers();
         }
-        let (parts, body) = request.send().await?.into_parts();
-        let checksum_sha256 = parts
-            .headers
-            .get(SHA256_CHECKSUM)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string());
 
-        let e_tag = match is_copy {
-            false => get_etag(&parts.headers).map_err(|source| Error::Metadata { source })?,
-            true => {
-                let response = body
-                    .bytes()
-                    .await
-                    .map_err(|source| Error::CreateMultipartResponseBody { source })?;
-                let response: CopyPartResult = quick_xml::de::from_reader(response.reader())
-                    .map_err(|source| Error::InvalidMultipartResponse { source })?;
-                response.e_tag
-            }
+        let (parts, body) = request.send().await?.into_parts();
+        let (e_tag, checksum_sha256, checksum_crc64nvme) = if is_copy {
+            let response = body
+                .bytes()
+                .await
+                .map_err(|source| Error::CreateMultipartResponseBody { source })?;
+            let response: CopyPartResult = quick_xml::de::from_reader(response.reader())
+                .map_err(|source| Error::InvalidMultipartResponse { source })?;
+            (
+                response.e_tag,
+                response.checksum_sha256,
+                response.checksum_crc64nvme,
+            )
+        } else {
+            let e_tag = get_etag(&parts.headers).map_err(|source| Error::Metadata { source })?;
+            let checksum_sha256 = parts
+                .headers
+                .get(SHA256_CHECKSUM)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string());
+            let checksum_crc64nvme = parts
+                .headers
+                .get(CRC64NVME_CHECKSUM)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string());
+            (e_tag, checksum_sha256, checksum_crc64nvme)
         };
 
-        let content_id = if self.config.checksum == Some(Checksum::SHA256) {
-            let meta = PartMetadata {
-                e_tag,
-                checksum_sha256,
-            };
-            quick_xml::se::to_string(&meta).unwrap()
-        } else {
-            e_tag
+        let content_id = match self.config.checksum {
+            Some(_) => {
+                let meta = PartMetadata {
+                    e_tag,
+                    checksum_sha256,
+                    checksum_crc64nvme,
+                };
+                quick_xml::se::to_string(&meta).unwrap()
+            }
+            None => e_tag,
         };
 
         Ok(PartId { content_id })
@@ -770,18 +873,22 @@ impl S3Client {
         let body = quick_xml::se::to_string(&request).unwrap();
 
         let credential = self.config.get_session_credential().await?;
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.path_url(location);
 
-        let request = self
-            .client
-            .post(url)
+        let mut builder = self.client.post(url);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
+
+        let request = builder
             .query(&[("uploadId", upload_id)])
             .body(body)
-            .with_aws_sigv4(credential.authorizer(), None);
+            .with_aws_sigv4(authorizer, None)?;
 
-        let request = match mode {
-            CompleteMultipartMode::Overwrite => request,
-            CompleteMultipartMode::Create => request.header("If-None-Match", "*"),
+        let (request, is_create) = match mode {
+            CompleteMultipartMode::Overwrite => (request, false),
+            CompleteMultipartMode::Create => (request.header("If-None-Match", "*"), true),
         };
 
         let response = request
@@ -790,16 +897,24 @@ impl S3Client {
             .retry_error_body(true)
             .send()
             .await
-            .map_err(|source| Error::CompleteMultipartRequest {
-                source,
-                path: location.as_ref().to_string(),
+            .map_err(|source| {
+                let path = location.as_ref().to_string();
+                if is_create && source.status() == Some(http::StatusCode::PRECONDITION_FAILED) {
+                    crate::Error::AlreadyExists {
+                        source: Box::new(source),
+                        path,
+                    }
+                } else {
+                    crate::Error::from(Error::CompleteMultipartRequest { source, path })
+                }
             })?;
 
-        let version = get_version(response.headers(), VERSION_HEADER)
+        let (parts, body) = response.into_parts();
+
+        let version = get_version(&parts.headers, VERSION_HEADER)
             .map_err(|source| Error::Metadata { source })?;
 
-        let data = response
-            .into_body()
+        let data = body
             .bytes()
             .await
             .map_err(|source| Error::CompleteMultipartResponseBody { source })?;
@@ -810,17 +925,19 @@ impl S3Client {
         Ok(PutResult {
             e_tag: Some(response.e_tag),
             version,
+            extensions: parts.extensions,
         })
     }
 
     #[cfg(test)]
     pub(crate) async fn get_object_tagging(&self, path: &Path) -> Result<HttpResponse> {
         let credential = self.config.get_session_credential().await?;
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = format!("{}?tagging", self.config.path_url(path));
         let response = self
             .client
             .request(Method::GET, url)
-            .with_aws_sigv4(credential.authorizer(), None)
+            .with_aws_sigv4(authorizer, None)?
             .send_retry(&self.config.retry_config)
             .await
             .map_err(|e| e.error(STORE, path.to_string()))?;
@@ -851,6 +968,7 @@ impl GetClient for S3Client {
         options: GetOptions,
     ) -> Result<HttpResponse> {
         let credential = self.config.get_session_credential().await?;
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.path_url(path);
         let method = match options.head {
             true => Method::HEAD,
@@ -858,6 +976,9 @@ impl GetClient for S3Client {
         };
 
         let mut builder = self.client.request(method, url);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
         if self
             .config
             .encryption_headers
@@ -873,7 +994,7 @@ impl GetClient for S3Client {
 
         let response = builder
             .with_get_options(options)
-            .with_aws_sigv4(credential.authorizer(), None)
+            .with_aws_sigv4(authorizer, None)?
             .retryable_request()
             .send(ctx)
             .await
@@ -892,7 +1013,11 @@ impl ListClient for Arc<S3Client> {
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
         let credential = self.config.get_session_credential().await?;
+        let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.bucket_endpoint.clone();
+
+        // Read before `opts.extensions` is moved into the request builder
+        let invalid_key_handling = opts.invalid_keys;
 
         let mut query = Vec::with_capacity(4);
 
@@ -925,11 +1050,17 @@ impl ListClient for Arc<S3Client> {
             .request(Method::GET, &url)
             .extensions(opts.extensions)
             .query(&query)
-            .with_aws_sigv4(credential.authorizer(), None)
+            .with_aws_sigv4(authorizer, None)?
             .send_retry(&self.config.retry_config)
             .await
-            .map_err(|source| Error::ListRequest { source })?
-            .into_body()
+            .map_err(|source| Error::ListRequest {
+                source,
+                path: prefix.unwrap_or_default().to_string(),
+            })?;
+
+        let (parts, body) = response.into_parts();
+
+        let response = body
             .bytes()
             .await
             .map_err(|source| Error::ListResponseBody { source })?;
@@ -939,9 +1070,13 @@ impl ListClient for Arc<S3Client> {
 
         let token = response.next_continuation_token.take();
 
+        let (mut result, invalid_keys) = to_list_result(response, invalid_key_handling)?;
+        result.extensions = parts.extensions;
+
         Ok(PaginatedListResult {
-            result: response.try_into()?,
+            result,
             page_token: token,
+            invalid_keys,
         })
     }
 }
@@ -953,11 +1088,49 @@ fn encode_path(path: &Path) -> PercentEncode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GetOptions;
+    use crate::ObjectStore;
+    use crate::aws::{AmazonS3, AmazonS3Builder};
     use crate::client::HttpClient;
+    use crate::client::get::GetClient;
     use crate::client::mock_server::MockServer;
+    use crate::client::retry::{RetryContext, RetryError};
+    use crate::list::{InvalidKeyHandling, PaginatedListStore};
+    use futures_util::{StreamExt, TryStreamExt};
     use http::Response;
-    use http::header::CONTENT_LENGTH;
+    use http::StatusCode;
+    use http::header::{AUTHORIZATION, CONTENT_LENGTH};
+    use hyper::Request;
+    use hyper::body::Incoming;
 
+    /// A failed list request must be classified by status, not flattened into `Generic`
+    #[test]
+    fn list_request_error_is_typed() {
+        let classify = |status| {
+            let source = RetryError::from_status(status);
+            let path = "logs/".to_string();
+            crate::Error::from(Error::ListRequest { source, path })
+        };
+
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN),
+            crate::Error::PermissionDenied { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED),
+            crate::Error::Unauthenticated { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::NOT_FOUND),
+            crate::Error::NotFound { ref path, .. } if path == "logs/"
+        ));
+        assert!(matches!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            crate::Error::Generic { .. }
+        ));
+    }
+
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_create_multipart_has_content_length() {
         let mock = MockServer::new().await;
@@ -990,11 +1163,15 @@ mod tests {
             retry_config: Default::default(),
             sign_payload: false,
             disable_tagging: false,
+            disable_bulk_delete: false,
             checksum: None,
             copy_if_not_exists: None,
             conditional_put: Default::default(),
             encryption_headers: Default::default(),
             request_payer: false,
+            crypto: None,
+            multipart_copy_threshold: 5 * 1024 * 1024 * 1024,
+            multipart_copy_part_size: 5 * 1024 * 1024 * 1024,
         };
 
         let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
@@ -1003,6 +1180,455 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap(), "test-upload-id");
+        mock.shutdown().await;
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_complete_multipart_create_existing_object() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get("if-none-match").unwrap(), "*");
+            Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(String::new())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let parts = vec![PartId {
+            content_id: "\"part-etag\"".to_string(),
+        }];
+        let err = client
+            .complete_multipart(
+                &Path::from("test"),
+                "test-upload-id",
+                parts,
+                CompleteMultipartMode::Create,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::AlreadyExists { ref path, .. } if path == "test"),
+            "unexpected error: {err}"
+        );
+        mock.shutdown().await;
+    }
+
+    fn assert_default_headers_signed(req: &Request<Incoming>) {
+        assert_eq!(req.headers().get("x-amz-meta-test").unwrap(), "test-value");
+        assert_eq!(req.headers().get("x-amz-tagging").unwrap(), "key=value");
+
+        let auth = req.headers().get(AUTHORIZATION).unwrap().to_str().unwrap();
+        assert!(
+            auth.contains("x-amz-meta-test"),
+            "x-amz-meta-test not in SignedHeaders: {auth}"
+        );
+        assert!(
+            auth.contains("x-amz-tagging"),
+            "x-amz-tagging not in SignedHeaders: {auth}"
+        );
+    }
+
+    fn default_headers_config(mock: &MockServer) -> S3Config {
+        let credential = AwsCredential {
+            key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            token: None,
+        };
+
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert("x-amz-meta-test", "test-value".parse().unwrap());
+        default_headers.insert("x-amz-tagging", "key=value".parse().unwrap());
+
+        S3Config {
+            bucket_endpoint: mock.url().to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Arc::new(crate::StaticCredentialProvider::new(credential)),
+            client_options: ClientOptions::new()
+                .with_allow_http(true)
+                .with_default_headers(default_headers),
+            crypto: None,
+            skip_signature: false,
+            session_provider: None,
+            retry_config: Default::default(),
+            sign_payload: false,
+            disable_tagging: false,
+            disable_bulk_delete: false,
+            checksum: None,
+            copy_if_not_exists: None,
+            conditional_put: Default::default(),
+            encryption_headers: Default::default(),
+            request_payer: false,
+            multipart_copy_threshold: 5 * 1024 * 1024 * 1024,
+            multipart_copy_part_size: 5 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_default_headers_signed_request() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            Response::builder()
+                .status(200)
+                .header("etag", "\"test-etag\"")
+                .body(String::new())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let result = client
+            .request(Method::PUT, &Path::from("test"))
+            .with_payload(PutPayload::default())
+            .unwrap()
+            .do_put()
+            .await;
+
+        assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_default_headers_signed_bulk_delete() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            Response::builder()
+                .status(200)
+                .body("<DeleteResult><Deleted><Key>test</Key></Deleted></DeleteResult>".to_string())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let result = client.bulk_delete_request(vec![Path::from("test")]).await;
+
+        assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    /// `(method, path, query)` captured for assertion outside the mock closure.
+    ///
+    /// `MockServer` swallows panics raised inside its response handler (the
+    /// connection just resets and the S3 retry logic can still surface an `Ok`
+    /// result), so assertions placed inside the closure are silently ignored.
+    /// We capture into shared state and assert in the test body instead.
+    type CapturedRequest = (Method, String, Option<String>);
+
+    fn capture(captured: &Arc<std::sync::Mutex<Vec<CapturedRequest>>>, req: &Request<Incoming>) {
+        captured.lock().unwrap().push((
+            req.method().clone(),
+            req.uri().path().to_string(),
+            req.uri().query().map(|s| s.to_string()),
+        ));
+    }
+
+    /// Build an `AmazonS3` via the public builder so that `bucket_endpoint`
+    /// is computed by the library from the addressing-style option — i.e.
+    /// the option under test actually drives the URL the client emits.
+    fn make_store(mock: &MockServer, virtual_hosted: bool, disable_bulk_delete: bool) -> AmazonS3 {
+        AmazonS3Builder::new()
+            .with_endpoint(mock.url())
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .with_virtual_hosted_style_request(virtual_hosted)
+            .with_disable_bulk_delete(disable_bulk_delete)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_delete_default() {
+        // Default: path-style + bulk delete enabled.
+        // `delete_stream` must issue a single `POST /{bucket}?delete`.
+        let mock = MockServer::new().await;
+        let captured: Arc<std::sync::Mutex<Vec<CapturedRequest>>> = Default::default();
+        let c = Arc::clone(&captured);
+        mock.push_fn(move |req| {
+            capture(&c, &req);
+            Response::builder()
+                .status(200)
+                .body("<DeleteResult><Deleted><Key>foo</Key></Deleted></DeleteResult>".to_string())
+                .unwrap()
+        });
+
+        let store = make_store(&mock, false, false);
+        let locations = futures_util::stream::iter(vec![Ok(Path::from("foo"))]).boxed();
+        let deleted: Vec<_> = store.delete_stream(locations).try_collect().await.unwrap();
+        assert_eq!(deleted.len(), 1);
+
+        let captured = captured.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "expected one bulk delete request");
+        assert_eq!(captured[0].0, Method::POST);
+        assert_eq!(captured[0].1, "/test-bucket");
+        assert_eq!(captured[0].2.as_deref(), Some("delete"));
+
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_default_with_disable_bulk() {
+        // Path-style + bulk delete disabled.
+        // `delete_stream` must fan out into `DELETE /{bucket}/{key}` (one per
+        // object, no `?delete` query).
+        let mock = MockServer::new().await;
+        let captured: Arc<std::sync::Mutex<Vec<CapturedRequest>>> = Default::default();
+        for _ in 0..2 {
+            let c = Arc::clone(&captured);
+            mock.push_fn(move |req| {
+                capture(&c, &req);
+                Response::builder().status(204).body(String::new()).unwrap()
+            });
+        }
+
+        let store = make_store(&mock, false, true);
+        let locations =
+            futures_util::stream::iter(vec![Ok(Path::from("foo")), Ok(Path::from("bar"))]).boxed();
+        let deleted: Vec<_> = store.delete_stream(locations).try_collect().await.unwrap();
+        assert_eq!(deleted.len(), 2);
+
+        let mut captured = captured.lock().unwrap().clone();
+        captured.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(captured.len(), 2, "expected one DELETE per object");
+        assert_eq!(
+            captured[0],
+            (Method::DELETE, "/test-bucket/bar".to_string(), None)
+        );
+        assert_eq!(
+            captured[1],
+            (Method::DELETE, "/test-bucket/foo".to_string(), None)
+        );
+
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_virtual_hosted() {
+        // Virtual-hosted style + bulk delete enabled.
+        // `delete_stream` must issue a single `POST /?delete` (bucket is in
+        // the host, not the path).
+        let mock = MockServer::new().await;
+        let captured: Arc<std::sync::Mutex<Vec<CapturedRequest>>> = Default::default();
+        let c = Arc::clone(&captured);
+        mock.push_fn(move |req| {
+            capture(&c, &req);
+            Response::builder()
+                .status(200)
+                .body("<DeleteResult><Deleted><Key>foo</Key></Deleted></DeleteResult>".to_string())
+                .unwrap()
+        });
+
+        let store = make_store(&mock, true, false);
+        let locations = futures_util::stream::iter(vec![Ok(Path::from("foo"))]).boxed();
+        let deleted: Vec<_> = store.delete_stream(locations).try_collect().await.unwrap();
+        assert_eq!(deleted.len(), 1);
+
+        let captured = captured.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "expected one bulk delete request");
+        assert_eq!(captured[0].0, Method::POST);
+        assert_eq!(captured[0].1, "/");
+        assert_eq!(captured[0].2.as_deref(), Some("delete"));
+
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_virtual_hosted_with_disable_bulk() {
+        // Virtual-hosted style + bulk delete disabled.
+        // `delete_stream` must fan out into `DELETE /{key}` (no bucket in
+        // path, no `?delete` query).
+        let mock = MockServer::new().await;
+        let captured: Arc<std::sync::Mutex<Vec<CapturedRequest>>> = Default::default();
+        for _ in 0..2 {
+            let c = Arc::clone(&captured);
+            mock.push_fn(move |req| {
+                capture(&c, &req);
+                Response::builder().status(204).body(String::new()).unwrap()
+            });
+        }
+
+        let store = make_store(&mock, true, true);
+        let locations =
+            futures_util::stream::iter(vec![Ok(Path::from("foo")), Ok(Path::from("bar"))]).boxed();
+        let deleted: Vec<_> = store.delete_stream(locations).try_collect().await.unwrap();
+        assert_eq!(deleted.len(), 2);
+
+        let mut captured = captured.lock().unwrap().clone();
+        captured.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(captured.len(), 2, "expected one DELETE per object");
+        assert_eq!(captured[0], (Method::DELETE, "/bar".to_string(), None));
+        assert_eq!(captured[1], (Method::DELETE, "/foo".to_string(), None));
+
+        mock.shutdown().await;
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_default_headers_signed_get_request() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            Response::builder()
+                .status(200)
+                .body("test-body".to_string())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+        let mut ctx = RetryContext::new(&client.config.retry_config);
+        let result = client
+            .get_request(&mut ctx, &Path::from("test"), GetOptions::default())
+            .await;
+
+        assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_default_headers_signed_complete_multipart() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            assert!(req.uri().query().unwrap_or("").contains("uploadId"));
+
+            Response::builder()
+                .status(200)
+                .body("<CompleteMultipartUploadResult><ETag>\"test-etag\"</ETag></CompleteMultipartUploadResult>".to_string())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let parts = vec![PartId {
+            content_id: "\"part-etag\"".to_string(),
+        }];
+        let _ = client
+            .complete_multipart(
+                &Path::from("test"),
+                "test-upload-id",
+                parts,
+                CompleteMultipartMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        mock.shutdown().await;
+    }
+
+    /// A truncated page holding one representable key, one that `Path` cannot
+    /// represent, and one that `Path::parse` would silently normalize.
+    const LIST_PAGE_WITH_INVALID_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ListBucketResult>
+    <Name>test-bucket</Name>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>token-abc</NextContinuationToken>
+    <Contents>
+        <Key>logs/a.mcap</Key>
+        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+        <Size>100</Size>
+    </Contents>
+    <Contents>
+        <Key>logs//b.mcap</Key>
+        <LastModified>2024-01-02T00:00:00.000Z</LastModified>
+        <Size>200</Size>
+    </Contents>
+    <Contents>
+        <Key>/logs/c.mcap</Key>
+        <LastModified>2024-01-03T00:00:00.000Z</LastModified>
+        <Size>300</Size>
+    </Contents>
+</ListBucketResult>";
+
+    #[tokio::test]
+    async fn test_list_paginated_invalid_key_error() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(LIST_PAGE_WITH_INVALID_KEY.to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock, false, false);
+        let err = store
+            .list_paginated(Some("logs/"), PaginatedListOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::InvalidPath { .. }),
+            "unexpected error: {err}"
+        );
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_paginated_invalid_key_skip() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(200)
+                .body(LIST_PAGE_WITH_INVALID_KEY.to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock, false, false);
+        let result = store
+            .list_paginated(
+                Some("logs/"),
+                PaginatedListOptions {
+                    invalid_keys: InvalidKeyHandling::Skip,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The valid entry is returned, and the continuation token survives the page
+        // that skipped an entry — so a scan can advance past the bad key.
+        assert_eq!(result.result.objects.len(), 1);
+        assert_eq!(result.result.objects[0].location.as_ref(), "logs/a.mcap");
+        assert_eq!(result.page_token.as_deref(), Some("token-abc"));
+
+        // Both the unrepresentable key and the one that would only parse after
+        // normalization are reported verbatim
+        let keys: Vec<_> = result.invalid_keys.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(keys, vec!["logs//b.mcap", "/logs/c.mcap"]);
+        mock.shutdown().await;
+    }
+
+    /// A list that fails must surface a typed error naming the prefix, not `Generic`
+    #[tokio::test]
+    async fn test_list_paginated_forbidden() {
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .status(403)
+                .body("<Error><Code>AccessDenied</Code></Error>".to_string())
+                .unwrap(),
+        );
+
+        let store = make_store(&mock, false, false);
+        let err = store
+            .list_paginated(Some("logs/"), PaginatedListOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::PermissionDenied { ref path, .. } if path == "logs/"),
+            "unexpected error: {err}"
+        );
         mock.shutdown().await;
     }
 }

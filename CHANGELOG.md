@@ -19,71 +19,58 @@
 
 # Changelog
 
-## [v0.12.4](https://github.com/apache/arrow-rs-object-store/tree/v0.12.4) (2025-09-19)
+## [v0.14.2](https://github.com/apache/arrow-rs-object-store/tree/v0.14.2) (2026-09-11)
 
-[Full Changelog](https://github.com/apache/arrow-rs-object-store/compare/v0.12.3...v0.12.4)
+[Full Changelog](https://github.com/apache/arrow-rs-object-store/compare/v0.14.1...v0.14.2)
 
 **Implemented enhancements:**
 
-- Allow flagging `PUT` operations as idempotent. [\#464](https://github.com/apache/arrow-rs-object-store/issues/464)
-- Release object store  `0.12.3` \(non breaking API\) Release July 2025 [\#428](https://github.com/apache/arrow-rs-object-store/issues/428)
-- LocalFileSystem: offset for `list_with_offset` can't be identified  / List results \*must\* be sorted [\#388](https://github.com/apache/arrow-rs-object-store/issues/388)
-- Support setting storage class when objects are written [\#330](https://github.com/apache/arrow-rs-object-store/issues/330)
-- Support auth using AssumeRoleWithWebIdentity for non-AWS S3-compatible implementations [\#283](https://github.com/apache/arrow-rs-object-store/issues/283)
-- Types from http through request leak into object\_store public interfaces but aren't re-exported [\#263](https://github.com/apache/arrow-rs-object-store/issues/263)
+- Implement `Clone` for `MicrosoftAzure` [\#824](https://github.com/apache/arrow-rs-object-store/issues/824)
+- Support URLs for jurisdiction-restricted buckets on R2 [\#814](https://github.com/apache/arrow-rs-object-store/issues/814)
+- Lightweight DNS cache with shuffle to prevent DNS flooding [\#726](https://github.com/apache/arrow-rs-object-store/issues/726)
+- Allow presigning object\_store multipart uploads  [\#271](https://github.com/apache/arrow-rs-object-store/issues/271)
+- Allow specifying `Content-Type` when signing object\_store PUT requests [\#270](https://github.com/apache/arrow-rs-object-store/issues/270)
 
 **Fixed bugs:**
 
-- Retry does not cover connection errors [\#368](https://github.com/apache/arrow-rs-object-store/issues/368)
+- Incomplete ASF license header in `src/client/s3.rs` \(caused -1 vote on 0.14.2 RC1\) [\#853](https://github.com/apache/arrow-rs-object-store/issues/853)
+- WriteMultipart::finish should abort after part upload failure [\#818](https://github.com/apache/arrow-rs-object-store/issues/818)
+- The 1.85 MSRV is inaccurate with all features [\#811](https://github.com/apache/arrow-rs-object-store/issues/811)
+- When the backend service returns an HTTP 500, the object store panics [\#414](https://github.com/apache/arrow-rs-object-store/issues/414)
 
 **Documentation updates:**
 
-- Improve documentation for http client timeout [\#390](https://github.com/apache/arrow-rs-object-store/pull/390) ([alamb](https://github.com/alamb))
+- Docs: point users uploading large objects at the multipart API [\#839](https://github.com/apache/arrow-rs-object-store/pull/839) ([alamb](https://github.com/alamb))
+- \[object-store\]: update release schedule [\#834](https://github.com/apache/arrow-rs-object-store/pull/834) ([alamb](https://github.com/alamb))
+- Add doc example for multipart upload to `GoogleCloudStorage::create_multipart` [\#803](https://github.com/apache/arrow-rs-object-store/pull/803) ([alamb](https://github.com/alamb))
+- Add doc example for multipart upload to `MicrosoftAzure::create_multipart` [\#802](https://github.com/apache/arrow-rs-object-store/pull/802) ([alamb](https://github.com/alamb))
+- Add doc example for multipart upload to AmazonS3::create\_multipart [\#801](https://github.com/apache/arrow-rs-object-store/pull/801) ([alamb](https://github.com/alamb))
 
 **Closed issues:**
 
-- When a client http request is retried, I would like more information in the `info!` about the retry [\#486](https://github.com/apache/arrow-rs-object-store/issues/486)
-- Range header causing AWS Signature issues [\#471](https://github.com/apache/arrow-rs-object-store/issues/471)
-- Impossible to downcast an Error::Generic into a RetryError [\#469](https://github.com/apache/arrow-rs-object-store/issues/469)
-- JWT session tokens cause SignatureDoesNotMatch with Supabase S3 [\#466](https://github.com/apache/arrow-rs-object-store/issues/466)
-- Double url-encoding of special characters in key names [\#457](https://github.com/apache/arrow-rs-object-store/issues/457)
-- Make `MultipartUpload` Sync [\#439](https://github.com/apache/arrow-rs-object-store/issues/439)
-- Integrate HDFS object store [\#424](https://github.com/apache/arrow-rs-object-store/issues/424)
-- Error performing POST when trying to write to S3 with a custom endpoint URL [\#408](https://github.com/apache/arrow-rs-object-store/issues/408)
+- Regression: `ClientOptions` no longer `UnwindSafe`/`RefUnwindSafe` after custom DNS resolver support \(\#728\) [\#835](https://github.com/apache/arrow-rs-object-store/issues/835)
+- Using `PutMode::Create` on Azure puts doesn't return `AlreadyExists` on failure [\#829](https://github.com/apache/arrow-rs-object-store/issues/829)
+- Release object store `0.14.1` \(non-breaking\) - Target August 2026 [\#761](https://github.com/apache/arrow-rs-object-store/issues/761)
+- Expose underlying object store capabilities \(e.g. ordered listing, negative ranges\) [\#675](https://github.com/apache/arrow-rs-object-store/issues/675)
 
 **Merged pull requests:**
 
-- Revert "refactor: remove AWS dynamo integration \(\#407\)" [\#493](https://github.com/apache/arrow-rs-object-store/pull/493) ([alamb](https://github.com/alamb))
-- Fix for clippy 1.90 [\#492](https://github.com/apache/arrow-rs-object-store/pull/492) ([alamb](https://github.com/alamb))
-- Add version 0.12.4 release plan to README [\#490](https://github.com/apache/arrow-rs-object-store/pull/490) ([alamb](https://github.com/alamb))
-- chore\(client/retry\): include error info in logs when retry occurs [\#487](https://github.com/apache/arrow-rs-object-store/pull/487) ([philjb](https://github.com/philjb))
-- AWS S3: Support STS endpoint, WebIdentity, RoleArn, RoleSession configuration [\#480](https://github.com/apache/arrow-rs-object-store/pull/480) ([Friede80](https://github.com/Friede80))
-- build\(deps\): bump actions/github-script from 7 to 8 [\#478](https://github.com/apache/arrow-rs-object-store/pull/478) ([dependabot[bot]](https://github.com/apps/dependabot))
-- build\(deps\): bump actions/setup-node from 4 to 5 [\#477](https://github.com/apache/arrow-rs-object-store/pull/477) ([dependabot[bot]](https://github.com/apps/dependabot))
-- build\(deps\): bump actions/setup-python from 5 to 6 [\#476](https://github.com/apache/arrow-rs-object-store/pull/476) ([dependabot[bot]](https://github.com/apps/dependabot))
-- chore: fix some clippy 1.89 warnings and ignore some doctests on wasm32 [\#468](https://github.com/apache/arrow-rs-object-store/pull/468) ([mbrobbel](https://github.com/mbrobbel))
-- Allow "application\_credentials" in `impl FromStr for GoogleConfigKey` [\#467](https://github.com/apache/arrow-rs-object-store/pull/467) ([kylebarron](https://github.com/kylebarron))
-- build\(deps\): bump actions/checkout from 4 to 5 [\#463](https://github.com/apache/arrow-rs-object-store/pull/463) ([dependabot[bot]](https://github.com/apps/dependabot))
-- Add storage class for aws, gcp, and azure [\#456](https://github.com/apache/arrow-rs-object-store/pull/456) ([matthewmturner](https://github.com/matthewmturner))
-- Remove use of deprecated StepRng from tests [\#449](https://github.com/apache/arrow-rs-object-store/pull/449) ([tustvold](https://github.com/tustvold))
-- Fix not retrying connection errors [\#445](https://github.com/apache/arrow-rs-object-store/pull/445) ([johnnyg](https://github.com/johnnyg))
-- Dont unwrap on body send [\#442](https://github.com/apache/arrow-rs-object-store/pull/442) ([cetra3](https://github.com/cetra3))
-- feat: re-export HTTP types used in public API [\#441](https://github.com/apache/arrow-rs-object-store/pull/441) ([ByteBaker](https://github.com/ByteBaker))
-- fix: update links in release docs and script [\#440](https://github.com/apache/arrow-rs-object-store/pull/440) ([mbrobbel](https://github.com/mbrobbel))
-- chore: prepare `0.12.3` release [\#437](https://github.com/apache/arrow-rs-object-store/pull/437) ([crepererum](https://github.com/crepererum))
-- aws: downgrade credential provider info! log messages to debug! [\#436](https://github.com/apache/arrow-rs-object-store/pull/436) ([asubiotto](https://github.com/asubiotto))
-- feat: retry on 408 [\#426](https://github.com/apache/arrow-rs-object-store/pull/426) ([criccomini](https://github.com/criccomini))
-- fix: expose source of `RetryError` [\#422](https://github.com/apache/arrow-rs-object-store/pull/422) ([crepererum](https://github.com/crepererum))
-- fix\(gcp\): throw error instead of panicking if read pem fails [\#421](https://github.com/apache/arrow-rs-object-store/pull/421) ([hugocasa](https://github.com/hugocasa))
-- chore: fix clippy 1.88 warnings [\#418](https://github.com/apache/arrow-rs-object-store/pull/418) ([mbrobbel](https://github.com/mbrobbel))
-- Bump quick-xml to version 0.38.0 [\#417](https://github.com/apache/arrow-rs-object-store/pull/417) ([raimannma](https://github.com/raimannma))
-- Prevent compilation error with all cloud features but fs turned on [\#412](https://github.com/apache/arrow-rs-object-store/pull/412) ([jder](https://github.com/jder))
-- Retry requests when status code is 429 [\#410](https://github.com/apache/arrow-rs-object-store/pull/410) ([paraseba](https://github.com/paraseba))
-- refactor: remove AWS dynamo integration [\#407](https://github.com/apache/arrow-rs-object-store/pull/407) ([crepererum](https://github.com/crepererum))
-- refactor: `PutMultiPartOpts` =\> `PutMultiPartOptions` [\#406](https://github.com/apache/arrow-rs-object-store/pull/406) ([crepererum](https://github.com/crepererum))
-- minor: Pin `tracing-attributes`, `tracing-core` to fix CI [\#404](https://github.com/apache/arrow-rs-object-store/pull/404) ([kylebarron](https://github.com/kylebarron))
-- feat \(azure\): support for account in `az://` URLs [\#403](https://github.com/apache/arrow-rs-object-store/pull/403) ([ByteBaker](https://github.com/ByteBaker))
-- Fix azure path parsing [\#399](https://github.com/apache/arrow-rs-object-store/pull/399) ([kylebarron](https://github.com/kylebarron))
+- Restore missing first line of ASF license header in `src/client/s3.rs` [\#854](https://github.com/apache/arrow-rs-object-store/pull/854) ([alamb](https://github.com/alamb))
+- feat: retry failed multipart part uploads [\#849](https://github.com/apache/arrow-rs-object-store/pull/849) ([criccomini](https://github.com/criccomini))
+- build\(deps\): bump taiki-e/install-action from 2.85.5 to 2.86.1 [\#842](https://github.com/apache/arrow-rs-object-store/pull/842) ([dependabot[bot]](https://github.com/apps/dependabot))
+- Restore `UnwindSafe`/`RefUnwindSafe` on `ClientOptions` by bounding `DnsResolver` [\#836](https://github.com/apache/arrow-rs-object-store/pull/836) ([alamb](https://github.com/alamb))
+- Return AlreadyExists in azure backend when using PutMode::Create and precondition fails [\#830](https://github.com/apache/arrow-rs-object-store/pull/830) ([itsjunetime](https://github.com/itsjunetime))
+- Signer: reexport `url::Url` and `http::Method` types in the `signer` module [\#827](https://github.com/apache/arrow-rs-object-store/pull/827) ([Tpt](https://github.com/Tpt))
+- Derive `Clone` for `MicrosoftAzure` [\#825](https://github.com/apache/arrow-rs-object-store/pull/825) ([kylebarron](https://github.com/kylebarron))
+- build\(deps\): bump taiki-e/install-action from 2 to 2.85.5 [\#823](https://github.com/apache/arrow-rs-object-store/pull/823) ([dependabot[bot]](https://github.com/apps/dependabot))
+- Fix \#818 - WriteMultipart::finish should abort after part upload failure [\#819](https://github.com/apache/arrow-rs-object-store/pull/819) ([anson-vandoren](https://github.com/anson-vandoren))
+- Support R2 URLs with jurisdictions [\#815](https://github.com/apache/arrow-rs-object-store/pull/815) ([Kharacternyk](https://github.com/Kharacternyk))
+- build\(deps\): update base64 requirement from 0.22 to 0.23 [\#813](https://github.com/apache/arrow-rs-object-store/pull/813) ([dependabot[bot]](https://github.com/apps/dependabot))
+- fix: restore 1.85 MSRV and fix MSRV CI [\#812](https://github.com/apache/arrow-rs-object-store/pull/812) ([LDeakin](https://github.com/LDeakin))
+- build\(deps\): bump actions/setup-python from 6 to 7 [\#809](https://github.com/apache/arrow-rs-object-store/pull/809) ([dependabot[bot]](https://github.com/apps/dependabot))
+- build\(deps\): bump actions/setup-node from 6 to 7 [\#804](https://github.com/apache/arrow-rs-object-store/pull/804) ([dependabot[bot]](https://github.com/apps/dependabot))
+- feat: presigned URLs with extra query params and signed headers \(SignedUrlOptions\) [\#771](https://github.com/apache/arrow-rs-object-store/pull/771) ([zfarrell](https://github.com/zfarrell))
+- feat: Support custom DNS resolver [\#728](https://github.com/apache/arrow-rs-object-store/pull/728) ([kdn36](https://github.com/kdn36))
 
 
 

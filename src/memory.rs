@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, stream::BoxStream};
+use futures_util::{StreamExt, stream::BoxStream};
 use parking_lot::RwLock;
 
 use crate::multipart::{MultipartStore, PartId};
@@ -78,7 +78,7 @@ impl From<Error> for super::Error {
 
 /// In-memory storage suitable for testing or for opting out of using a cloud
 /// storage provider.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InMemory {
     storage: SharedStorage,
 }
@@ -116,6 +116,7 @@ struct Storage {
 
 #[derive(Debug, Default, Clone)]
 struct PartStorage {
+    attributes: Attributes,
     parts: Vec<Option<Bytes>>,
 }
 
@@ -156,7 +157,7 @@ impl Storage {
                 source: format!("Object at location {location} not found").into(),
             }),
             Some(e) => {
-                let existing = e.e_tag.to_string();
+                let existing = format!("\"{}\"", e.e_tag);
                 let expected = v.e_tag.ok_or(Error::MissingETag)?;
                 if existing == expected {
                     *e = entry;
@@ -216,8 +217,9 @@ impl ObjectStore for InMemory {
         storage.next_etag += 1;
 
         Ok(PutResult {
-            e_tag: Some(etag.to_string()),
+            e_tag: Some(format!("\"{}\"", etag)),
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -236,7 +238,7 @@ impl ObjectStore for InMemory {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let entry = self.entry(location)?;
-        let e_tag = entry.e_tag.to_string();
+        let e_tag = format!("\"{}\"", entry.e_tag);
 
         let meta = ObjectMeta {
             location: location.clone(),
@@ -259,13 +261,14 @@ impl ObjectStore for InMemory {
             }
             None => (0..entry.data.len() as u64, entry.data),
         };
-        let stream = futures::stream::once(futures::future::ready(Ok(data)));
+        let stream = futures_util::stream::once(futures_util::future::ready(Ok(data)));
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream.boxed()),
             attributes: entry.attributes,
             meta,
             range,
+            extensions: Default::default(),
         })
     }
 
@@ -292,11 +295,6 @@ impl ObjectStore for InMemory {
                 Ok(entry.data.slice(r_start..r_end))
             })
             .collect()
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.storage.write().map.remove(location);
-        Ok(())
     }
 
     fn delete_stream(
@@ -333,13 +331,13 @@ impl ObjectStore for InMemory {
                     location: key.clone(),
                     last_modified: value.last_modified,
                     size: value.data.len() as u64,
-                    e_tag: Some(value.e_tag.to_string()),
+                    e_tag: Some(format!("\"{}\"", value.e_tag)),
                     version: None,
                 })
             })
             .collect();
 
-        futures::stream::iter(values).boxed()
+        futures_util::stream::iter(values).boxed()
     }
 
     /// The memory implementation returns all results, as opposed to the cloud
@@ -372,13 +370,13 @@ impl ObjectStore for InMemory {
             };
 
             if parts.next().is_some() {
-                common_prefixes.insert(prefix.child(common_prefix));
+                common_prefixes.insert(prefix.clone().join(common_prefix));
             } else {
                 let object = ObjectMeta {
                     location: k.clone(),
                     last_modified: v.last_modified,
                     size: v.data.len() as u64,
-                    e_tag: Some(v.e_tag.to_string()),
+                    e_tag: Some(format!("\"{}\"", v.e_tag)),
                     version: None,
                 };
                 objects.push(object);
@@ -388,6 +386,7 @@ impl ObjectStore for InMemory {
         Ok(ListResult {
             objects,
             common_prefixes: common_prefixes.into_iter().collect(),
+            extensions: Default::default(),
         })
     }
 
@@ -422,10 +421,25 @@ impl ObjectStore for InMemory {
 #[async_trait]
 impl MultipartStore for InMemory {
     async fn create_multipart(&self, _path: &Path) -> Result<MultipartId> {
+        self.create_multipart_opts(_path, PutMultipartOptions::default())
+            .await
+    }
+
+    async fn create_multipart_opts(
+        &self,
+        _path: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<MultipartId> {
         let mut storage = self.storage.write();
         let etag = storage.next_etag;
         storage.next_etag += 1;
-        storage.uploads.insert(etag, Default::default());
+        storage.uploads.insert(
+            etag,
+            PartStorage {
+                attributes: opts.attributes,
+                parts: Default::default(),
+            },
+        );
         Ok(etag.to_string())
     }
 
@@ -438,7 +452,7 @@ impl MultipartStore for InMemory {
     ) -> Result<PartId> {
         let mut storage = self.storage.write();
         let upload = storage.upload_mut(id)?;
-        if part_idx <= upload.parts.len() {
+        if part_idx >= upload.parts.len() {
             upload.parts.resize(part_idx + 1, None);
         }
         upload.parts[part_idx] = Some(payload.into());
@@ -464,10 +478,11 @@ impl MultipartStore for InMemory {
         for x in &upload.parts {
             buf.extend_from_slice(x.as_ref().unwrap())
         }
-        let etag = storage.insert(path, buf.into(), Default::default());
+        let etag = storage.insert(path, buf.into(), upload.attributes);
         Ok(PutResult {
-            e_tag: Some(etag.to_string()),
+            e_tag: Some(format!("\"{}\"", etag)),
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -517,7 +532,7 @@ struct InMemoryUpload {
 impl MultipartUpload for InMemoryUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
         self.parts.push(payload);
-        Box::pin(futures::future::ready(Ok(())))
+        Box::pin(futures_util::future::ready(Ok(())))
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
@@ -532,8 +547,9 @@ impl MultipartUpload for InMemoryUpload {
         );
 
         Ok(PutResult {
-            e_tag: Some(etag.to_string()),
+            e_tag: Some(format!("\"{}\"", etag)),
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -553,6 +569,7 @@ mod tests {
         let integration = InMemory::new();
 
         put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
         get_opts(&integration).await;
         list_uses_directories_correctly(&integration).await;
         list_with_delimiter(&integration).await;
@@ -561,7 +578,9 @@ mod tests {
         stream_get(&integration).await;
         put_opts(&integration, true).await;
         multipart(&integration, &integration).await;
+        multipart_with_opts(&integration, &integration).await;
         put_get_attributes(&integration).await;
+        multipart_put_part_out_of_order(&integration, &integration).await;
     }
 
     #[tokio::test]
@@ -569,6 +588,7 @@ mod tests {
         let integration: Box<dyn ObjectStore> = Box::new(InMemory::new());
 
         put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
         get_opts(&integration).await;
         list_uses_directories_correctly(&integration).await;
         list_with_delimiter(&integration).await;
@@ -582,6 +602,7 @@ mod tests {
         let integration: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
         get_opts(&integration).await;
         list_uses_directories_correctly(&integration).await;
         list_with_delimiter(&integration).await;

@@ -19,6 +19,9 @@
 //!
 //! This follows [rfc2518] commonly known as [WebDAV]
 //!
+//! See the [Feature Flags](crate#feature-flags) section for the difference
+//! between the `http` and `http-base` features.
+//!
 //! Basic get support will work out of the box with most HTTP servers,
 //! even those that don't explicitly support [rfc2518]
 //!
@@ -34,8 +37,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
@@ -104,11 +107,15 @@ impl ObjectStore for HttpStore {
     ) -> Result<PutResult> {
         if opts.mode != PutMode::Overwrite {
             // TODO: Add support for If header - https://datatracker.ietf.org/doc/html/rfc2518#section-9.4
-            return Err(crate::Error::NotImplemented);
+            return Err(crate::Error::NotImplemented {
+                operation: "`put_opts` with a mode other than `PutMode::Overwrite`".into(),
+                implementer: self.to_string(),
+            });
         }
 
         let response = self.client.put(location, payload, opts.attributes).await?;
-        let e_tag = match get_etag(response.headers()) {
+        let (parts, _) = response.into_parts();
+        let e_tag = match get_etag(&parts.headers) {
             Ok(e_tag) => Some(e_tag),
             Err(crate::client::header::Error::MissingEtag) => None,
             Err(source) => return Err(Error::Metadata { source }.into()),
@@ -117,6 +124,7 @@ impl ObjectStore for HttpStore {
         Ok(PutResult {
             e_tag,
             version: None,
+            extensions: parts.extensions,
         })
     }
 
@@ -125,15 +133,14 @@ impl ObjectStore for HttpStore {
         _location: &Path,
         _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        Err(crate::Error::NotImplemented)
+        Err(crate::Error::NotImplemented {
+            operation: "`put_multipart_opts`".into(),
+            implementer: self.to_string(),
+        })
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.client.get_opts(location, options).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.delete(location).await
     }
 
     fn delete_stream(
@@ -158,7 +165,7 @@ impl ObjectStore for HttpStore {
         let prefix_len = prefix.map(|p| p.as_ref().len()).unwrap_or_default();
         let prefix = prefix.cloned();
         let client = Arc::clone(&self.client);
-        futures::stream::once(async move {
+        futures_util::stream::once(async move {
             let status = client.list(prefix.as_ref(), "infinity").await?;
 
             let iter = status
@@ -172,7 +179,7 @@ impl ObjectStore for HttpStore {
                 // Filter out exact prefix matches
                 .filter_ok(move |r| r.location.as_ref().len() > prefix_len);
 
-            Ok::<_, crate::Error>(futures::stream::iter(iter))
+            Ok::<_, crate::Error>(futures_util::stream::iter(iter))
         })
         .try_flatten()
         .boxed()
@@ -207,6 +214,7 @@ impl ObjectStore for HttpStore {
         Ok(ListResult {
             common_prefixes,
             objects,
+            extensions: status.extensions,
         })
     }
 
@@ -300,9 +308,12 @@ mod tests {
         maybe_skip_integration!();
         let url = std::env::var("HTTP_URL").expect("HTTP_URL must be set");
         let options = ClientOptions::new().with_allow_http(true);
+        // tag the extensions of every HTTP response with a marker,
+        // allowing response_extensions to verify their propagation
         let integration = HttpBuilder::new()
             .with_url(url)
             .with_client_options(options)
+            .with_http_connector(MarkerHttpConnector::default())
             .build()
             .unwrap();
 
@@ -311,5 +322,6 @@ mod tests {
         list_with_delimiter(&integration).await;
         rename_and_copy(&integration).await;
         copy_if_not_exists(&integration).await;
+        response_extensions(&integration, false).await;
     }
 }

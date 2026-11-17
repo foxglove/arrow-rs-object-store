@@ -18,8 +18,8 @@ use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 use std::time::Duration;
 
+use http::header::HeaderValue;
 use humantime::{format_duration, parse_duration};
-use reqwest::header::HeaderValue;
 
 use crate::{Error, Result};
 
@@ -108,6 +108,15 @@ impl Parse for u32 {
         Self::from_str(v).map_err(|_| Error::Generic {
             store: "Config",
             source: format!("failed to parse \"{v}\" as u32").into(),
+        })
+    }
+}
+
+impl Parse for u64 {
+    fn parse(v: &str) -> Result<Self> {
+        Self::from_str(v).map_err(|_| Error::Generic {
+            store: "Config",
+            source: format!("failed to parse \"{v}\" as u64").into(),
         })
     }
 }

@@ -17,13 +17,17 @@
 
 //! An object store implementation for Azure blob storage
 //!
+//! See the [Feature Flags](crate#feature-flags) section for the difference
+//! between the `azure` and `azure-base` features.
+//!
 //! ## Streaming uploads
 //!
 //! [`ObjectStore::put_multipart_opts`] will upload data in blocks and write a blob from those blocks.
 //!
 //! Unused blocks will automatically be dropped after 7 days.
+//!
 use crate::{
-    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
+    CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     UploadPart,
     multipart::{MultipartStore, PartId},
@@ -31,16 +35,17 @@ use crate::{
     signer::Signer,
 };
 use async_trait::async_trait;
-use futures::stream::{BoxStream, StreamExt, TryStreamExt};
-use reqwest::Method;
+use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
+use http::Method;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
+use crate::client::{CredentialProvider, crypto_provider};
+use crate::retry::{MultipartRetry, RetryPolicy};
 pub use credential::{AzureAccessKey, AzureAuthorizer, authority_hosts};
 
 mod builder;
@@ -52,13 +57,13 @@ pub type AzureCredentialProvider = Arc<dyn CredentialProvider<Credential = Azure
 use crate::azure::client::AzureClient;
 use crate::client::parts::Parts;
 use crate::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
-pub use builder::{AzureConfigKey, MicrosoftAzureBuilder};
+pub use builder::{AzureConfigKey, MicrosoftAzureBuilder, split_sas};
 pub use credential::AzureCredential;
 
 const STORE: &str = "MicrosoftAzure";
 
 /// Interface for [Microsoft Azure Blob Storage](https://azure.microsoft.com/en-us/services/storage/blobs/).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MicrosoftAzure {
     client: Arc<AzureClient>,
 }
@@ -102,6 +107,7 @@ impl ObjectStore for MicrosoftAzure {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let retry_policy = opts.retry_policy();
         Ok(Box::new(AzureMultiPartUpload {
             part_idx: 0,
             opts,
@@ -109,6 +115,7 @@ impl ObjectStore for MicrosoftAzure {
                 client: Arc::clone(&self.client),
                 location: location.clone(),
                 parts: Default::default(),
+                retry_policy,
             }),
         }))
     }
@@ -117,13 +124,29 @@ impl ObjectStore for MicrosoftAzure {
         self.client.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.delete_request(location, &()).await
-    }
-
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.client.list(prefix)
     }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        if self.client.config().is_emulator {
+            // Azurite doesn't support the startFrom query parameter,
+            // fall back to client-side filtering
+            //
+            // See https://github.com/Azure/Azurite/issues/2619#issuecomment-3660701055
+            let offset = offset.clone();
+            self.list(prefix)
+                .try_filter(move |f| futures_util::future::ready(f.location > offset))
+                .boxed()
+        } else {
+            self.client.list_with_offset(prefix, offset)
+        }
+    }
+
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
@@ -140,7 +163,7 @@ impl ObjectStore for MicrosoftAzure {
                     client
                         .bulk_delete_request(locations)
                         .await
-                        .map(futures::stream::iter)
+                        .map(futures_util::stream::iter)
                 }
             })
             .buffered(20)
@@ -170,6 +193,13 @@ impl Signer for MicrosoftAzure {
     /// Create a URL containing the relevant [Service SAS] query parameters that authorize a request
     /// via `method` to the resource at `path` valid for the duration specified in `expires_in`.
     ///
+    /// Unlike S3 and GCS, Azure does not implement [`Signer::signed_url_opts`]: a SAS signs a
+    /// fixed set of fields rather than folding arbitrary query parameters or request headers into
+    /// the signature, so that method returns an error if extra query parameters or headers are
+    /// supplied. This is not needed for presigned block-blob uploads — a SAS authorizes by
+    /// permission and resource, so a client can append the unsigned `comp=block` and `blockid`
+    /// operation parameters to the URL returned by [`Signer::signed_url`].
+    ///
     /// [Service SAS]: https://learn.microsoft.com/en-us/rest/api/storageservices/create-service-sas
     ///
     /// # Example
@@ -180,7 +210,7 @@ impl Signer for MicrosoftAzure {
     /// ```
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # use object_store::{azure::MicrosoftAzureBuilder, path::Path, signer::Signer};
-    /// # use reqwest::Method;
+    /// # use http::Method;
     /// # use std::time::Duration;
     /// #
     /// let azure = MicrosoftAzureBuilder::new()
@@ -198,9 +228,16 @@ impl Signer for MicrosoftAzure {
     /// # }
     /// ```
     async fn signed_url(&self, method: Method, path: &Path, expires_in: Duration) -> Result<Url> {
+        if self.client.config().encryption_headers.is_enabled() {
+            return Err(crate::Error::NotSupported {
+                source: "Azure signed URLs cannot be used with customer-provided keys because CPK values must be supplied as request headers".into(),
+            });
+        }
+
+        let crypto = crypto_provider(self.client.crypto())?;
         let mut url = self.path_url(path);
         let signer = self.client.signer(expires_in).await?;
-        signer.sign(&method, &mut url)?;
+        signer.sign(crypto, &method, &mut url)?;
         Ok(url)
     }
 
@@ -210,11 +247,18 @@ impl Signer for MicrosoftAzure {
         paths: &[Path],
         expires_in: Duration,
     ) -> Result<Vec<Url>> {
+        if self.client.config().encryption_headers.is_enabled() {
+            return Err(crate::Error::NotSupported {
+                source: "Azure signed URLs cannot be used with customer-provided keys because CPK values must be supplied as request headers".into(),
+            });
+        }
+
+        let crypto = crypto_provider(self.client.crypto())?;
         let mut urls = Vec::with_capacity(paths.len());
         let signer = self.client.signer(expires_in).await?;
         for path in paths {
             let mut url = self.path_url(path);
-            signer.sign(&method, &mut url)?;
+            signer.sign(crypto, &method, &mut url)?;
             urls.push(url);
         }
         Ok(urls)
@@ -238,6 +282,7 @@ struct UploadState {
     location: Path,
     parts: Parts,
     client: Arc<AzureClient>,
+    retry_policy: Option<Arc<dyn RetryPolicy>>,
 }
 
 #[async_trait]
@@ -246,10 +291,23 @@ impl MultipartUpload for AzureMultiPartUpload {
         let idx = self.part_idx;
         self.part_idx += 1;
         let state = Arc::clone(&self.state);
+        let content_id = AzureClient::new_block_id();
         Box::pin(async move {
-            let part = state.client.put_block(&state.location, idx, data).await?;
-            state.parts.put(idx, part);
-            Ok(())
+            let mut retry = MultipartRetry::new(state.retry_policy.clone());
+            loop {
+                match state
+                    .client
+                    .put_block(&state.location, &content_id, data.clone())
+                    .await
+                {
+                    Ok(part) => {
+                        state.parts.put(idx, part);
+                        return Ok(());
+                    }
+                    Err(error) if retry.should_retry(&error).await => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         })
     }
 
@@ -270,18 +328,92 @@ impl MultipartUpload for AzureMultiPartUpload {
 
 #[async_trait]
 impl MultipartStore for MicrosoftAzure {
+    /// Create a new multipart upload, returning its [`MultipartId`].
+    ///
+    /// This is the low-level [`MultipartStore`] API, which gives direct control
+    /// over individual parts. See [`ObjectStoreExt::put_multipart`] for a
+    /// higher-level API that handles parts automatically.
+    ///
+    /// # Example
+    ///
+    /// Create a multipart upload, upload two parts, and finalize it by calling
+    /// [`complete_multipart`]:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use object_store::{azure::MicrosoftAzureBuilder, multipart::MultipartStore, path::Path, PutPayload};
+    /// #
+    /// let azure = MicrosoftAzureBuilder::new()
+    ///     .with_account("my-account")
+    ///     .with_container_name("my-container")
+    ///     .with_access_key("my-access-key")
+    ///     .build()?;
+    ///
+    /// let path = Path::from("data/large_file");
+    ///
+    /// // Start the upload, obtaining an id used to reference it in later calls
+    /// let id = azure.create_multipart(&path).await?;
+    ///
+    /// // Upload the individual parts. Azure stores each part as a block.
+    /// let part0 = azure
+    ///     .put_part(&path, &id, 0, PutPayload::from("the first part"))
+    ///     .await?;
+    /// let part1 = azure
+    ///     .put_part(&path, &id, 1, PutPayload::from("the final part"))
+    ///     .await?;
+    ///
+    /// // Finalize the upload. The parts must be provided in `part_idx` order.
+    /// azure.complete_multipart(&path, &id, vec![part0, part1]).await?;
+    /// #     Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Azure stores each part as a block, so a single blob may contain at most
+    /// 50,000 parts, each up to 4,000 MiB. Parts may be uploaded concurrently and
+    /// in any order, provided each is given the correct `part_idx`. See
+    /// [Azure block blob limits] for the full set of size and count constraints.
+    ///
+    /// Azure has no way to explicitly discard uploaded blocks, so
+    /// [`abort_multipart`] is a no-op: any uncommitted blocks are automatically
+    /// garbage collected roughly one week after the last write.
+    ///
+    /// [`ObjectStoreExt::put_multipart`]: crate::ObjectStoreExt::put_multipart
+    /// [`complete_multipart`]: MultipartStore::complete_multipart
+    /// [`abort_multipart`]: MultipartStore::abort_multipart
+    /// [Azure block blob limits]: https://learn.microsoft.com/en-us/rest/api/storageservices/put-block
     async fn create_multipart(&self, _: &Path) -> Result<MultipartId> {
         Ok(String::new())
+    }
+
+    async fn create_multipart_opts(
+        &self,
+        path: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<MultipartId> {
+        let PutMultipartOptions {
+            tags,
+            attributes,
+            extensions: _,
+        } = opts;
+
+        if !tags.is_empty() || !attributes.is_empty() {
+            return Err(Error::NotSupported {
+                source: "`create_multipart_opts` with non-default options is not supported by MicrosoftAzure".into(),
+            });
+        }
+
+        self.create_multipart(path).await
     }
 
     async fn put_part(
         &self,
         path: &Path,
         _: &MultipartId,
-        part_idx: usize,
+        _: usize,
         data: PutPayload,
     ) -> Result<PartId> {
-        self.client.put_block(path, part_idx, data).await
+        let content_id = AzureClient::new_block_id();
+        self.client.put_block(path, &content_id, data).await
     }
 
     async fn complete_multipart(
@@ -319,14 +451,45 @@ mod tests {
     use crate::ObjectStoreExt;
     use crate::integration::*;
     use crate::tests::*;
+    use crate::{Attribute, Attributes};
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
     use bytes::Bytes;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn azure_create_multipart_opts_rejects_attributes() {
+        let integration = MicrosoftAzureBuilder::new()
+            .with_container_name("test")
+            .with_use_emulator(true)
+            .build()
+            .unwrap();
+        let opts = PutMultipartOptions {
+            attributes: Attributes::from_iter([(Attribute::Metadata("key".into()), "value")]),
+            ..Default::default()
+        };
+
+        let err = integration
+            .create_multipart_opts(&Path::from("test"), opts)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::NotSupported { .. }));
+    }
 
     #[tokio::test]
     async fn azure_blob_test() {
         maybe_skip_integration!();
-        let integration = MicrosoftAzureBuilder::from_env().build().unwrap();
+        // tag the extensions of every HTTP response with a marker,
+        // allowing response_extensions to verify their propagation
+        let integration = MicrosoftAzureBuilder::from_env()
+            .with_http_connector(MarkerHttpConnector::default())
+            .build()
+            .unwrap();
 
         put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
         get_opts(&integration).await;
         list_uses_directories_correctly(&integration).await;
         list_with_delimiter(&integration).await;
@@ -335,10 +498,12 @@ mod tests {
         stream_get(&integration).await;
         put_opts(&integration, true).await;
         multipart(&integration, &integration).await;
+        multipart_put_part_out_of_order(&integration, &integration).await;
         multipart_race_condition(&integration, false).await;
         multipart_out_of_order(&integration).await;
         signing(&integration).await;
         list_paginated(&integration, &integration).await;
+        response_extensions(&integration, true).await;
 
         let validate = !integration.client.config().disable_tagging;
         tagging(
@@ -357,6 +522,134 @@ mod tests {
         if !integration.client.config().is_emulator {
             put_get_attributes(&integration).await;
         }
+    }
+
+    #[ignore = "Used for manual testing against a real Workspace Private Link Endpoint."]
+    #[tokio::test]
+    async fn azure_onelake_wspl_test() {
+        maybe_skip_integration!();
+
+        let url =
+            std::env::var("AZURE_ONELAKE_URL").expect("Set AZURE_ONELAKE_URL to a WS-PL FQDN");
+        let parsed = url::Url::parse(&url).unwrap();
+
+        let path = match parsed.scheme() {
+            "abfss" | "abfs" => {
+                // abfss://<container>@<host>/<path...>
+                // container is in username, entire path is the object path
+                let segments: Vec<&str> = parsed.path_segments().unwrap().collect();
+                Path::from(segments.join("/"))
+            }
+            _ => {
+                // https://<host>/<container>/<path...>
+                // first segment is container, rest is the object path
+                let segments: Vec<&str> = parsed.path_segments().unwrap().collect();
+                Path::from(segments[1..].join("/"))
+            }
+        };
+
+        let store = MicrosoftAzureBuilder::new()
+            .with_url(&url)
+            .with_bearer_token_authorization(
+                std::env::var("AZURE_STORAGE_TOKEN").expect("Set AZURE_STORAGE_TOKEN"),
+            )
+            .build()
+            .unwrap();
+
+        let data = Bytes::from("Hello OneLake WSPL");
+
+        store.put(&path, data.clone().into()).await.unwrap();
+        let result = store.get(&path).await.unwrap();
+        let loaded = result.bytes().await.unwrap();
+        assert_eq!(data, loaded);
+        store.delete(&path).await.unwrap();
+    }
+
+    // Azurite doesn't support CPK (just ignores it)
+    #[ignore = "Used for manual testing against a real storage account."]
+    #[tokio::test]
+    async fn azure_blob_cpk_test() {
+        let base = MicrosoftAzureBuilder::from_env();
+        let key = BASE64_STANDARD.encode([7_u8; 32]);
+        let wrong_key = BASE64_STANDARD.encode([9_u8; 32]);
+
+        let encrypted = base.clone().with_encryption_key(&key).build().unwrap();
+        let unencrypted = base.clone().build().unwrap();
+        let wrong = base.with_encryption_key(&wrong_key).build().unwrap();
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = Path::from(format!("cpk-test-{suffix}.txt"));
+        let copy_path = Path::from(format!("cpk-test-copy-{suffix}.txt"));
+        let payload = Bytes::from("customer-provided-key");
+
+        encrypted.put(&path, payload.clone().into()).await.unwrap();
+
+        let loaded = encrypted.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(loaded, payload);
+
+        let range = encrypted.get_range(&path, 9..17).await.unwrap();
+        assert_eq!(range, Bytes::from("provided"));
+
+        let meta = encrypted.head(&path).await.unwrap();
+        assert_eq!(meta.size, payload.len() as u64);
+
+        encrypted.copy(&path, &copy_path).await.unwrap();
+        let copied = encrypted
+            .get(&copy_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(copied, payload);
+
+        assert!(unencrypted.get(&path).await.is_err());
+        assert!(wrong.get(&path).await.is_err());
+        assert!(unencrypted.head(&path).await.is_err());
+        assert!(wrong.get_range(&path, 0..8).await.is_err());
+        assert!(unencrypted.get(&copy_path).await.is_err());
+        assert!(wrong.get(&copy_path).await.is_err());
+        let meta = encrypted.head(&copy_path).await.unwrap();
+        assert_eq!(meta.size, payload.len() as u64);
+
+        encrypted.delete(&copy_path).await.unwrap();
+        encrypted.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn azure_signed_url_rejects_cpk_configuration() {
+        let store = MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("testcontainer")
+            .with_access_key("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+            .with_encryption_key(BASE64_STANDARD.encode([7_u8; 32]))
+            .build()
+            .unwrap();
+
+        let err = store
+            .signed_url(
+                Method::GET,
+                &Path::from("file.txt"),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotSupported { .. }));
+        assert!(err.to_string().contains("customer-provided keys"));
+
+        let err = store
+            .signed_urls(
+                Method::GET,
+                &[Path::from("file.txt")],
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotSupported { .. }));
+        assert!(err.to_string().contains("customer-provided keys"));
     }
 
     #[ignore = "Used for manual testing against a real storage account."]
