@@ -100,7 +100,7 @@ ring = ["dep:ring", "rustls-pki-types"]
 # Implementation base features.
 # These compile provider logic without forcing reqwest or a crypto provider.
 azure-base = ["cloud-base", "httparse"]
-gcp-base = ["cloud-base"]
+gcp-base = ["cloud-base", "md-5"]
 aws-base = ["cloud-base", "crc-fast", "md-5"]
 http-base = ["cloud-base"]
 
